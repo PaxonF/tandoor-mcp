@@ -254,10 +254,11 @@ Items are referred to by food name (e.g. `"lemons"`, plurals match) or entry ID;
 ### Food & Inventory
 
 - `search_foods` — Search for foods/ingredients with fuzzy name matching
-- `update_pantry` — Mark foods on hand / not on hand (Tandoor tracks on-hand status, not quantities). Matches existing foods by exact name or plural (case-insensitive) and creates foods that don't exist yet when marked available (disable with `create_missing: false`). Optional `supermarket_category` is set on the food
+- `update_pantry` — Mark foods on hand / not on hand and keep Tandoor's **Pantry** in sync. `available: true` sets the food's on-hand flag and adds it to the Pantry; optional `location` (default `"Pantry"`, created if new; a name containing "Freezer" is marked as a freezer), `sub_location`, `amount` (default 1), `unit` (default `"pcs"`) and `expires` (YYYY-MM-DD). A food already in the Pantry is updated (only the fields you pass), never duplicated. `available: false` clears the flag and removes its Pantry entries. Matches existing foods by exact name or plural (case-insensitive) and creates foods that don't exist yet when marked available (disable with `create_missing: false`). Optional `supermarket_category` is set on the food. On Tandoor versions without the Pantry/Inventory API only the on-hand flag changes
+- `get_inventory` — List what's in the Pantry, grouped by location and sub-location (food, amount, unit, expiry). Optional `location` and `expiring_within_days` filters
 - `find_duplicate_foods` — List foods that look like duplicates (same name apart from case, spacing, or a simple plural)
 - `merge_foods` — Merge one food into another by ID; recipes and shopping entries move to the target and the source food is **deleted**
-- `suggest_from_inventory` — Get recipe suggestions based on current inventory
+- `suggest_from_inventory` — Recipe suggestions from what's on hand (Pantry entries plus foods flagged on hand). `mode: "expiring"` only suggests recipes that use Pantry items expiring within `days_until_expiry` days (default 3)
 - `get_unit_conversions` — List unit conversions, optionally filtered by food ID
 
 ### Meal Planning

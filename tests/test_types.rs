@@ -4,7 +4,9 @@
 //! correctly handle the API response shapes we've observed in the wild, including
 //! the `created_by` field that ships as a full user object rather than an integer.
 
-use mcp_tandoor::client::{CookLog, MealPlan, MealType, PaginatedResponse, Recipe};
+use mcp_tandoor::client::{
+    CookLog, InventoryEntry, InventoryLocation, MealPlan, MealType, PaginatedResponse, Recipe,
+};
 
 // ── Recipe deserialization ────────────────────────────────────────────────────
 
@@ -249,4 +251,66 @@ fn cook_log_nested_recipe_shape() {
     assert_eq!(log.recipe_id(), Some(7));
     assert_eq!(log.recipe_name(), Some("Soup"));
     assert_eq!(log.servings, None);
+}
+
+// ── Inventory (Pantry) deserialization ────────────────────────────────────────
+
+#[test]
+fn inventory_entry_current_tandoor_shape() {
+    // Trimmed from a live /api/inventory-entry/ response: nested location/household,
+    // full food and unit objects, null expires and note
+    let json = r##"{
+        "id": 1,
+        "inventory_location": {"id": 1, "name": "Pantry", "is_freezer": false,
+            "household": {"id": 1, "name": "Fischer",
+                "created_at": "2026-10-13T17:08:55.135319-06:00",
+                "updated_at": "2026-10-14T16:42:03.859501-06:00"}},
+        "sub_location": "Produce",
+        "code": "1",
+        "food": {"id": 776, "name": "garlic", "plural_name": null, "description": "",
+            "food_onhand": true, "properties": [], "supermarket_category": {"id": 19, "name": "Produce"}},
+        "unit": {"id": 91, "name": "head", "plural_name": "heads", "description": null,
+            "base_unit": null, "open_data_slug": null},
+        "amount": 1.0,
+        "expires": null,
+        "note": null,
+        "label": "#1 - 1.00 (head) garlic",
+        "created_at": "2026-10-14T16:41:16.950042-06:00",
+        "created_by": 1
+    }"##;
+    let entry: InventoryEntry = serde_json::from_str(json).expect("should deserialize entry");
+    assert_eq!(entry.id, 1);
+    assert_eq!(entry.food_id(), Some(776));
+    assert_eq!(entry.location_name(), "Pantry");
+    assert_eq!(entry.unit.as_ref().unwrap().name, "head");
+    assert_eq!(entry.amount, 1.0);
+    assert_eq!(entry.expires, None);
+    assert_eq!(entry.sub_location.as_deref(), Some("Produce"));
+    assert_eq!(
+        entry.inventory_location.unwrap().household.unwrap().name,
+        "Fischer"
+    );
+}
+
+#[test]
+fn inventory_entry_string_amount_and_expiry() {
+    let json = r#"{"id": 2, "inventory_location": {"id": 3, "name": "Freezer", "is_freezer": true,
+        "household": {"id": 1, "name": "Fischer"}}, "sub_location": null,
+        "food": {"id": 5, "name": "peas"}, "unit": {"id": 1, "name": "bag"},
+        "amount": "2.50", "expires": "2027-01-01", "note": "back left"}"#;
+    let entry: InventoryEntry = serde_json::from_str(json).expect("should deserialize entry");
+    assert_eq!(entry.amount, 2.5);
+    assert_eq!(entry.expires.as_deref(), Some("2027-01-01"));
+    assert!(entry.inventory_location.unwrap().is_freezer);
+}
+
+#[test]
+fn inventory_location_shape() {
+    let json = r#"{"id": 2, "name": "Fridge", "is_freezer": false,
+        "household": {"id": 1, "name": "Fischer", "created_at": "2026-10-13T17:08:55.135319-06:00",
+            "updated_at": "2026-10-14T16:41:02.465340-06:00"}}"#;
+    let location: InventoryLocation = serde_json::from_str(json).expect("should deserialize");
+    assert_eq!(location.name, "Fridge");
+    assert!(!location.is_freezer);
+    assert_eq!(location.household.unwrap().id, 1);
 }
