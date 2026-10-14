@@ -4,6 +4,32 @@ use crate::client::{auth::TandoorAuth, types::*};
 use anyhow::Result;
 use reqwest::Client;
 
+/// Turn a non-2xx response into an error that carries Tandoor's response body,
+/// so validation details (e.g. `{"from_date": ["This field is required."]}`)
+/// reach the MCP client instead of a bare "400 Bad Request".
+async fn error_for_status(response: reqwest::Response, context: &str) -> Result<reqwest::Response> {
+    let status = response.status();
+    if status.is_success() {
+        return Ok(response);
+    }
+    let body = response.text().await.unwrap_or_default();
+    let body = body.trim();
+    // Server errors come back as an HTML page, which is noise to an MCP client
+    if body.is_empty() || body.starts_with('<') {
+        anyhow::bail!("{context}: {status}");
+    }
+    const MAX_BODY: usize = 1000;
+    match body.char_indices().nth(MAX_BODY) {
+        Some((cut, _)) => anyhow::bail!("{context}: {status} - {}…", &body[..cut]),
+        None => anyhow::bail!("{context}: {status} - {body}"),
+    }
+}
+
+/// Tandoor applies its meal-plan date filter (default: a window around today) to
+/// the detail endpoint too, so plans outside it 404 on update and delete unless an
+/// explicit range is given.
+const MEAL_PLAN_ANY_DATE: &str = "from_date=1900-01-01&to_date=9999-12-31";
+
 /// # Tandoor HTTP Client
 ///
 /// A comprehensive HTTP client for interacting with the Tandoor recipe management API.
@@ -503,9 +529,7 @@ impl TandoorClient {
             .send()
             .await?;
 
-        if !response.status().is_success() {
-            anyhow::bail!("Failed to update food availability: {}", response.status());
-        }
+        let response = error_for_status(response, "Failed to update food availability").await?;
 
         let food = response.json().await?;
         Ok(food)
@@ -595,9 +619,7 @@ impl TandoorClient {
             .send()
             .await?;
 
-        if !response.status().is_success() {
-            anyhow::bail!("Failed to add to shopping list: {}", response.status());
-        }
+        let response = error_for_status(response, "Failed to add to shopping list").await?;
 
         let entry = response.json().await?;
         Ok(entry)
@@ -943,12 +965,7 @@ impl TandoorClient {
             .send()
             .await?;
 
-        if !response.status().is_success() {
-            anyhow::bail!(
-                "Failed to update shopping list entry: {}",
-                response.status()
-            );
-        }
+        let response = error_for_status(response, "Failed to update shopping list entry").await?;
 
         let entry = response.json().await?;
         Ok(entry)
@@ -965,12 +982,7 @@ impl TandoorClient {
             .send()
             .await?;
 
-        if !response.status().is_success() {
-            anyhow::bail!(
-                "Failed to delete shopping list entry: {}",
-                response.status()
-            );
-        }
+        error_for_status(response, "Failed to delete shopping list entry").await?;
 
         Ok(())
     }
@@ -1047,9 +1059,7 @@ impl TandoorClient {
             .send()
             .await?;
 
-        if !response.status().is_success() {
-            anyhow::bail!("Failed to create meal plan: {}", response.status());
-        }
+        let response = error_for_status(response, "Failed to create meal plan").await?;
 
         let meal_plan = response.json().await?;
         Ok(meal_plan)
@@ -1061,7 +1071,10 @@ impl TandoorClient {
         body: serde_json::Value,
     ) -> Result<MealPlan> {
         let auth_header = self.get_auth_header()?;
-        let url = format!("{}/api/meal-plan/{}/", self.base_url, plan_id);
+        let url = format!(
+            "{}/api/meal-plan/{}/?{MEAL_PLAN_ANY_DATE}",
+            self.base_url, plan_id
+        );
 
         let response = self
             .client
@@ -1083,7 +1096,10 @@ impl TandoorClient {
 
     pub async fn delete_meal_plan(&self, plan_id: i32) -> Result<()> {
         let auth_header = self.get_auth_header()?;
-        let url = format!("{}/api/meal-plan/{}/", self.base_url, plan_id);
+        let url = format!(
+            "{}/api/meal-plan/{}/?{MEAL_PLAN_ANY_DATE}",
+            self.base_url, plan_id
+        );
 
         let response = self
             .client
@@ -1092,9 +1108,7 @@ impl TandoorClient {
             .send()
             .await?;
 
-        if !response.status().is_success() {
-            anyhow::bail!("Failed to delete meal plan: {}", response.status());
-        }
+        error_for_status(response, "Failed to delete meal plan").await?;
 
         Ok(())
     }
@@ -1111,9 +1125,7 @@ impl TandoorClient {
             .send()
             .await?;
 
-        if !response.status().is_success() {
-            anyhow::bail!("Failed to get meal types: {}", response.status());
-        }
+        let response = error_for_status(response, "Failed to get meal types").await?;
 
         let meal_types = response.json().await?;
         Ok(meal_types)
@@ -1197,9 +1209,7 @@ impl TandoorClient {
             .send()
             .await?;
 
-        if !response.status().is_success() {
-            anyhow::bail!("Failed to log cooked recipe: {}", response.status());
-        }
+        let response = error_for_status(response, "Failed to log cooked recipe").await?;
 
         let cook_log = response.json().await?;
         Ok(cook_log)
@@ -1415,9 +1425,7 @@ impl TandoorClient {
             .await
             .map_err(|e| anyhow::anyhow!("Failed to connect to Tandoor API: {e}"))?;
 
-        if !response.status().is_success() {
-            anyhow::bail!("Failed to delete recipe {}: {}", id, response.status());
-        }
+        error_for_status(response, &format!("Failed to delete recipe {id}")).await?;
         Ok(())
     }
 
@@ -1439,9 +1447,7 @@ impl TandoorClient {
             .await
             .map_err(|e| anyhow::anyhow!("Failed to connect to Tandoor API: {e}"))?;
 
-        if !response.status().is_success() {
-            anyhow::bail!("Failed to get recipe books: {}", response.status());
-        }
+        let response = error_for_status(response, "Failed to get recipe books").await?;
         let books = response.json().await?;
         Ok(books)
     }
@@ -1502,9 +1508,7 @@ impl TandoorClient {
             .await
             .map_err(|e| anyhow::anyhow!("Failed to connect to Tandoor API: {e}"))?;
 
-        if !response.status().is_success() {
-            anyhow::bail!("Failed to delete recipe book {}: {}", id, response.status());
-        }
+        error_for_status(response, &format!("Failed to delete recipe book {id}")).await?;
         Ok(())
     }
 
@@ -1526,9 +1530,7 @@ impl TandoorClient {
             .await
             .map_err(|e| anyhow::anyhow!("Failed to connect to Tandoor API: {e}"))?;
 
-        if !response.status().is_success() {
-            anyhow::bail!("Failed to get recipe book entries: {}", response.status());
-        }
+        let response = error_for_status(response, "Failed to get recipe book entries").await?;
         let entries = response.json().await?;
         Ok(entries)
     }
@@ -1570,13 +1572,11 @@ impl TandoorClient {
             .await
             .map_err(|e| anyhow::anyhow!("Failed to connect to Tandoor API: {e}"))?;
 
-        if !response.status().is_success() {
-            anyhow::bail!(
-                "Failed to remove recipe book entry {}: {}",
-                entry_id,
-                response.status()
-            );
-        }
+        error_for_status(
+            response,
+            &format!("Failed to remove recipe book entry {entry_id}"),
+        )
+        .await?;
         Ok(())
     }
 
@@ -1592,9 +1592,7 @@ impl TandoorClient {
             .await
             .map_err(|e| anyhow::anyhow!("Failed to connect to Tandoor API: {e}"))?;
 
-        if !response.status().is_success() {
-            anyhow::bail!("Failed to get supermarkets: {}", response.status());
-        }
+        let response = error_for_status(response, "Failed to get supermarkets").await?;
         let supermarkets = response.json().await?;
         Ok(supermarkets)
     }
@@ -1617,9 +1615,7 @@ impl TandoorClient {
             .await
             .map_err(|e| anyhow::anyhow!("Failed to connect to Tandoor API: {e}"))?;
 
-        if !response.status().is_success() {
-            anyhow::bail!("Failed to get unit conversions: {}", response.status());
-        }
+        let response = error_for_status(response, "Failed to get unit conversions").await?;
         let conversions = response.json().await?;
         Ok(conversions)
     }

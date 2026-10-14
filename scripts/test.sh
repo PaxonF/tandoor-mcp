@@ -100,7 +100,8 @@ start_services() {
     log_info "Waiting for services to be ready..."
     local retries=0
     while [ $retries -lt $MAX_RETRIES ]; do
-        if docker compose -f "$COMPOSE_FILE" exec -T web_recipes curl -sf http://localhost:8080/login/ > /dev/null 2>&1; then
+        # Probe from the host: newer Tandoor images no longer ship curl
+        if curl -sf http://localhost:8080/accounts/login/ > /dev/null 2>&1; then
             log_success "Tandoor is ready!"
             return 0
         fi

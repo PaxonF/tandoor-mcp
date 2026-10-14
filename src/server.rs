@@ -194,6 +194,26 @@ pub struct AddStepInput {
 }
 
 /// An ingredient entry is either a food or a section header, never both.
+/// Parse a meal-plan date given as `YYYY-MM-DD`, naming the offending field on error.
+fn parse_plan_date(field: &str, value: &str) -> Result<chrono::NaiveDate, McpError> {
+    chrono::NaiveDate::parse_from_str(value.trim(), "%Y-%m-%d").map_err(|e| {
+        McpError::invalid_params(
+            format!("Invalid {field}: expected YYYY-MM-DD"),
+            Some(json!({"field": field, "value": value, "error": e.to_string()})),
+        )
+    })
+}
+
+fn check_plan_range(from: chrono::NaiveDate, to: chrono::NaiveDate) -> Result<(), McpError> {
+    if to < from {
+        return Err(McpError::invalid_params(
+            "end_date must not be before date",
+            Some(json!({"date": from, "end_date": to})),
+        ));
+    }
+    Ok(())
+}
+
 fn validate_ingredient(ing: &RecipeStepIngredientInput) -> Result<(), String> {
     let has_food = ing.food.as_deref().is_some_and(|f| !f.trim().is_empty());
     match &ing.header {
@@ -1469,12 +1489,18 @@ pub struct GetMealPlansParams {
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct CreateMealPlanParams {
+    /// Recipe to plan; omit for a free-text entry and set `title` instead
     #[serde(default)]
     pub recipe_id: Option<i32>,
     #[serde(default)]
     pub title: Option<String>,
-    pub servings: i32,
-    pub date: String, // YYYY-MM-DD format
+    pub servings: f64,
+    /// Start date, YYYY-MM-DD
+    pub date: String,
+    /// Last day for a multi-day plan, YYYY-MM-DD (defaults to `date`)
+    #[serde(default)]
+    pub end_date: Option<String>,
+    /// Meal type ID from get_meal_types
     pub meal_type: i32,
     #[serde(default)]
     pub note: Option<String>,
@@ -1493,10 +1519,14 @@ pub struct UpdateMealPlanParams {
     #[serde(default)]
     pub title: Option<String>,
     #[serde(default)]
-    pub servings: Option<i32>,
-    /// YYYY-MM-DD format
+    pub servings: Option<f64>,
+    /// New start date, YYYY-MM-DD; also moves the end date unless `end_date` is given
     #[serde(default)]
     pub date: Option<String>,
+    /// New last day for a multi-day plan, YYYY-MM-DD
+    #[serde(default)]
+    pub end_date: Option<String>,
+    /// Meal type ID from get_meal_types
     #[serde(default)]
     pub meal_type: Option<i32>,
     #[serde(default)]
@@ -2858,14 +2888,15 @@ impl TandoorMcpServer {
                     .map(|plan| {
                         json!({
                             "id": plan.id,
-                            "date": plan.date,
+                            "date": plan.date(),
+                            "end_date": plan.end_date(),
                             "meal_type": plan.meal_type.name,
+                            "meal_type_id": plan.meal_type.id,
                             "recipe_id": plan.recipe.as_ref().map(|r| r.id),
                             "recipe_name": plan.recipe.as_ref().map(|r| &r.name),
                             "title": plan.title,
                             "servings": plan.servings,
-                            "note": plan.note,
-                            "created": plan.created
+                            "note": plan.note
                         })
                     })
                     .collect();
@@ -2894,7 +2925,7 @@ impl TandoorMcpServer {
     }
 
     #[tool(
-        description = "Create a new meal plan",
+        description = "Create a meal plan entry for a recipe (or a free-text title) on a date. Get meal_type IDs from get_meal_types",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -2922,18 +2953,19 @@ impl TandoorMcpServer {
             }
         };
 
-        let date = chrono::NaiveDate::parse_from_str(&params.date, "%Y-%m-%d").map_err(|e| {
-            McpError::invalid_params(
-                "Invalid date format",
-                Some(serde_json::json!({"error": e.to_string()})),
-            )
-        })?;
+        let from_date = parse_plan_date("date", &params.date)?;
+        let to_date = match params.end_date.as_deref() {
+            Some(end) => parse_plan_date("end_date", end)?,
+            None => from_date,
+        };
+        check_plan_range(from_date, to_date)?;
 
         let request = crate::client::types::CreateMealPlanRequest {
             recipe: params.recipe_id,
             title: params.title,
             servings: params.servings,
-            date,
+            from_date,
+            to_date,
             meal_type: params.meal_type,
             note: params.note,
         };
@@ -2942,14 +2974,14 @@ impl TandoorMcpServer {
             Ok(meal_plan) => {
                 let result = json!({
                     "id": meal_plan.id,
-                    "date": meal_plan.date,
+                    "date": meal_plan.date(),
+                    "end_date": meal_plan.end_date(),
                     "meal_type": meal_plan.meal_type.name,
                     "recipe_id": meal_plan.recipe.as_ref().map(|r| r.id),
                     "recipe_name": meal_plan.recipe.as_ref().map(|r| &r.name),
                     "title": meal_plan.title,
                     "servings": meal_plan.servings,
                     "note": meal_plan.note,
-                    "created": meal_plan.created,
                     "success": true,
                     "message": "Meal plan created successfully"
                 });
@@ -2972,7 +3004,7 @@ impl TandoorMcpServer {
     }
 
     #[tool(
-        description = "Update fields on an existing meal plan (recipe, title, servings, date, meal_type, note) without deleting and recreating it",
+        description = "Update fields on an existing meal plan (recipe, title, servings, date, end_date, meal_type, note) without deleting and recreating it",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -3003,17 +3035,27 @@ impl TandoorMcpServer {
         if let Some(v) = params.servings {
             body.insert("servings".to_string(), json!(v));
         }
-        if let Some(v) = params.date {
-            let date = match chrono::NaiveDate::parse_from_str(&v, "%Y-%m-%d") {
-                Ok(d) => d,
-                Err(e) => {
-                    return Err(McpError::invalid_params(
-                        "Invalid date format",
-                        Some(serde_json::json!({"error": e.to_string()})),
-                    ));
-                }
-            };
-            body.insert("date".to_string(), json!(date));
+        // Tandoor silently ignores a `date` key, so set from_date/to_date. Moving the
+        // start without an explicit end keeps the plan single-day on the new date.
+        let from_date = params
+            .date
+            .as_deref()
+            .map(|d| parse_plan_date("date", d))
+            .transpose()?;
+        let to_date = params
+            .end_date
+            .as_deref()
+            .map(|d| parse_plan_date("end_date", d))
+            .transpose()?
+            .or(from_date);
+        if let (Some(from), Some(to)) = (from_date, to_date) {
+            check_plan_range(from, to)?;
+        }
+        if let Some(v) = from_date {
+            body.insert("from_date".to_string(), json!(v));
+        }
+        if let Some(v) = to_date {
+            body.insert("to_date".to_string(), json!(v));
         }
         if let Some(v) = params.meal_type {
             body.insert("meal_type".to_string(), json!(v));
@@ -3029,7 +3071,8 @@ impl TandoorMcpServer {
             Ok(meal_plan) => Ok(CallToolResult::success(vec![Content::text(
                 serde_json::to_string_pretty(&json!({
                     "id": meal_plan.id,
-                    "date": meal_plan.date,
+                    "date": meal_plan.date(),
+                    "end_date": meal_plan.end_date(),
                     "meal_type": meal_plan.meal_type.name,
                     "recipe_id": meal_plan.recipe.as_ref().map(|r| r.id),
                     "recipe_name": meal_plan.recipe.as_ref().map(|r| &r.name),
@@ -4796,7 +4839,7 @@ impl TandoorMcpServer {
                 }
             };
 
-            let scale = plan.servings as f64 / detailed.servings.unwrap_or(1) as f64;
+            let scale = plan.servings / detailed.servings.unwrap_or(1) as f64;
 
             for step in &detailed.steps {
                 for ingredient in &step.ingredients {
