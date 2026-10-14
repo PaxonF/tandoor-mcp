@@ -71,6 +71,10 @@ impl Settings {
 
     /// Look up an environment variable, preferring its Home Assistant option when set.
     fn get(&self, env_key: &str) -> Option<String> {
+        self.get_with(env_key, |key| env::var(key).ok())
+    }
+
+    fn get_with(&self, env_key: &str, env: impl Fn(&str) -> Option<String>) -> Option<String> {
         HA_OPTION_ENV
             .iter()
             .find(|(_, env)| *env == env_key)
@@ -81,7 +85,7 @@ impl Settings {
                 other => Some(other.to_string()),
             })
             .filter(|s| !s.is_empty())
-            .or_else(|| env::var(env_key).ok().filter(|s| !s.is_empty()))
+            .or_else(|| env(env_key).filter(|s| !s.is_empty()))
     }
 }
 
@@ -199,11 +203,17 @@ mod tests {
     #[test]
     fn empty_or_missing_ha_option_falls_back_to_env() {
         let s = settings(r#"{"tandoor_auth_token": "  ", "tandoor_password": null}"#);
+        let env = |key: &str| match key {
+            "TANDOOR_AUTH_TOKEN" => Some("from-env".to_string()),
+            "TANDOOR_PASSWORD" => Some(String::new()),
+            _ => None,
+        };
         assert_eq!(
-            s.get("TANDOOR_AUTH_TOKEN"),
-            env::var("TANDOOR_AUTH_TOKEN").ok()
+            s.get_with("TANDOOR_AUTH_TOKEN", env).as_deref(),
+            Some("from-env")
         );
-        assert_eq!(s.get("TANDOOR_PASSWORD"), env::var("TANDOOR_PASSWORD").ok());
+        // An empty env var counts as unset, like an empty option
+        assert_eq!(s.get_with("TANDOOR_PASSWORD", env), None);
     }
 
     #[test]

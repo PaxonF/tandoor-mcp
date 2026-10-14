@@ -393,15 +393,41 @@ pub struct ShoppingFood {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct MealPlan {
     pub id: i32,
+    #[serde(default)]
     pub title: Option<String>,
+    #[serde(default)]
     pub recipe: Option<Recipe>,
-    pub servings: i32,
+    /// Tandoor stores servings as a decimal (e.g. `2.0`)
+    pub servings: f64,
+    #[serde(default)]
     pub note: Option<String>,
-    pub date: chrono::NaiveDate,
+    /// Start as a local datetime, e.g. `2026-10-19T12:00:00-04:00`
+    pub from_date: String,
+    /// End as a local datetime; equals `from_date` for single-day plans
+    #[serde(default)]
+    pub to_date: Option<String>,
     pub meal_type: MealType,
-    pub created: DateTime<Utc>,
-    pub updated: DateTime<Utc>,
+    #[serde(default)]
     pub created_by: serde_json::Value,
+    #[serde(default)]
+    pub shopping: bool,
+}
+
+impl MealPlan {
+    /// Start date as `YYYY-MM-DD`, in the Tandoor server's timezone.
+    pub fn date(&self) -> &str {
+        local_date(&self.from_date)
+    }
+
+    /// End date as `YYYY-MM-DD`, falling back to the start date.
+    pub fn end_date(&self) -> &str {
+        self.to_date.as_deref().map_or(self.date(), local_date)
+    }
+}
+
+/// The `YYYY-MM-DD` prefix of a local ISO-8601 datetime (no timezone conversion).
+fn local_date(datetime: &str) -> &str {
+    datetime.get(..10).unwrap_or(datetime)
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -529,11 +555,16 @@ pub struct CreateShoppingListEntryRequest {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CreateMealPlanRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub recipe: Option<i32>,
+    /// Tandoor rejects `null` here, so unset fields are omitted
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
-    pub servings: i32,
-    pub date: chrono::NaiveDate,
+    pub servings: f64,
+    pub from_date: chrono::NaiveDate,
+    pub to_date: chrono::NaiveDate,
     pub meal_type: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
 }
 
