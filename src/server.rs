@@ -194,6 +194,27 @@ pub struct AddStepInput {
 }
 
 /// An ingredient entry is either a food or a section header, never both.
+/// Make a parsed `recipe-from-source` recipe acceptable to the create endpoint, which
+/// rejects the parser's `null` ingredient `order`.
+fn prepare_parsed_recipe(recipe: &mut serde_json::Value) {
+    let Some(steps) = recipe["steps"].as_array_mut() else {
+        return;
+    };
+    for (step_order, step) in steps.iter_mut().enumerate() {
+        if step["order"].is_null() {
+            step["order"] = json!(step_order);
+        }
+        let Some(ingredients) = step["ingredients"].as_array_mut() else {
+            continue;
+        };
+        for (order, ingredient) in ingredients.iter_mut().enumerate() {
+            if ingredient["order"].is_null() {
+                ingredient["order"] = json!(order);
+            }
+        }
+    }
+}
+
 /// Parse a meal-plan date given as `YYYY-MM-DD`, naming the offending field on error.
 fn parse_plan_date(field: &str, value: &str) -> Result<chrono::NaiveDate, McpError> {
     chrono::NaiveDate::parse_from_str(value.trim(), "%Y-%m-%d").map_err(|e| {
@@ -1114,15 +1135,20 @@ async fn resolve_shopping_lists(
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct GetShoppingListParams {
-    #[serde(default = "default_format")]
-    pub format: String,
+    /// `flat` (default): one list of items. `grouped`: unchecked and checked items separately
+    #[serde(default)]
+    pub format: ShoppingListFormat,
     /// Only items on this named shopping list (name or ID)
     #[serde(default)]
     pub shopping_list: Option<NameOrId>,
 }
 
-fn default_format() -> String {
-    "flat".to_string()
+#[derive(Debug, Default, PartialEq, serde::Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum ShoppingListFormat {
+    #[default]
+    Flat,
+    Grouped,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -1174,7 +1200,7 @@ pub struct UpdatePantryItem {
     pub food: String,
     /// Whether the food is on hand
     pub available: bool,
-    /// Supermarket category to assign if the food has to be created (e.g. "Produce")
+    /// Supermarket category to assign (e.g. "Produce"); created if it doesn't exist
     #[serde(default)]
     pub supermarket_category: Option<String>,
 }
@@ -1507,6 +1533,18 @@ pub struct CreateMealPlanParams {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct CreateMealTypeParams {
+    /// e.g. "Breakfast", "Lunch", "Dinner"
+    pub name: String,
+    /// Default time of day, HH:MM (24-hour)
+    #[serde(default)]
+    pub time: Option<String>,
+    /// Hex color, e.g. "#ffc107"
+    #[serde(default)]
+    pub color: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct DeleteMealPlanParams {
     pub id: i32,
 }
@@ -1602,8 +1640,6 @@ pub struct UpdateRecipeParams {
     pub waiting_time: Option<i64>,
     #[serde(default)]
     pub source_url: Option<String>,
-    #[serde(default)]
-    pub source_title: Option<String>,
     /// Edit specific existing steps (instruction, name, time, and that step's ingredients).
     /// Steps not listed are left untouched. Preferred way to change steps.
     #[serde(default)]
@@ -2162,6 +2198,7 @@ impl TandoorMcpServer {
                     "total_time": recipe.working_time.unwrap_or(0) + recipe.waiting_time.unwrap_or(0),
                     "keywords": recipe.keywords.into_iter().map(|k| k.name).collect::<Vec<String>>(),
                     "image": recipe.image,
+                    "source_url": recipe.source_url,
                     "nutrition": recipe.nutrition,
                     "created": recipe.created,
                     "updated": recipe.updated,
@@ -2283,7 +2320,7 @@ impl TandoorMcpServer {
     }
 
     #[tool(
-        description = "Import a recipe from a URL. Tandoor will scrape and parse the page. Returns the imported recipe or an error message if the site is not supported.",
+        description = "Import a recipe from a URL and save it to Tandoor. Tandoor scrapes and parses the page; the recipe is then created with its steps, ingredients, keywords, source URL and photo. Returns the new recipe's ID, or an error if the site can't be scraped (many sites block it). `possible_duplicates` lists existing recipes Tandoor thinks match.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -2303,32 +2340,92 @@ impl TandoorMcpServer {
             }
         };
 
-        match client.import_recipe_from_url(&params.url).await {
-            Ok(result) => {
-                if result.error {
-                    Ok(CallToolResult::error(vec![Content::text(
-                        json!({
-                            "error": "Import failed",
-                            "message": result.msg,
-                            "duplicates": result.duplicates,
-                        })
-                        .to_string(),
-                    )]))
-                } else {
-                    Ok(CallToolResult::success(vec![Content::text(
-                        json!({
-                            "message": result.msg,
-                            "recipe_id": result.recipe_id,
-                            "recipe": result.recipe,
-                        })
-                        .to_string(),
-                    )]))
-                }
-            }
-            Err(e) => Ok(CallToolResult::error(vec![Content::text(
-                json!({"error": "Failed to import recipe", "details": e.to_string()}).to_string(),
-            )])),
+        let fail = |error: &str, details: String| {
+            Ok(CallToolResult::error(vec![Content::text(
+                json!({"error": error, "details": details}).to_string(),
+            )]))
+        };
+        let parsed = match client.import_recipe_from_url(params.url.trim()).await {
+            Ok(parsed) => parsed,
+            Err(e) => return fail("Failed to import recipe", e.to_string()),
+        };
+        if parsed.error {
+            return Ok(CallToolResult::error(vec![Content::text(
+                json!({
+                    "error": "Import failed",
+                    "message": parsed.msg,
+                    "duplicates": parsed.duplicates,
+                })
+                .to_string(),
+            )]));
         }
+        let possible_duplicates: Vec<serde_json::Value> = parsed
+            .duplicates
+            .iter()
+            .map(|d| json!({"id": d["id"], "name": d["name"]}))
+            .collect();
+
+        // recipe-from-source only parses the page; the recipe still has to be saved
+        let Some(mut recipe) = parsed.recipe else {
+            return fail(
+                "Import failed",
+                format!("Tandoor parsed nothing from the page: {}", parsed.msg),
+            );
+        };
+        let image_url = recipe
+            .as_object_mut()
+            .and_then(|r| r.remove("image_url"))
+            .and_then(|v| v.as_str().map(str::to_string))
+            .filter(|u| !u.is_empty());
+        prepare_parsed_recipe(&mut recipe);
+
+        let created = match client.api_create("recipe", recipe).await {
+            Ok(created) => created,
+            Err(e) => {
+                return fail(
+                    "Parsed the page but failed to save the recipe",
+                    e.to_string(),
+                )
+            }
+        };
+        let recipe_id = created["id"].as_i64().unwrap_or_default() as i32;
+
+        // Best effort: a missing photo shouldn't fail an otherwise good import
+        let image = match image_url {
+            None => json!("none found on the page"),
+            Some(url) => match client.download_image(&url).await {
+                Ok((bytes, extension)) => {
+                    match client
+                        .upload_recipe_image(recipe_id, bytes, extension)
+                        .await
+                    {
+                        Ok(_) => json!("added"),
+                        Err(e) => json!(format!("not added: {e}")),
+                    }
+                }
+                Err(e) => json!(format!("not added: {e}")),
+            },
+        };
+
+        let steps = created["steps"].as_array().cloned().unwrap_or_default();
+        let ingredient_count: usize = steps
+            .iter()
+            .map(|s| s["ingredients"].as_array().map_or(0, Vec::len))
+            .sum();
+        tool_ok(json!({
+            "id": recipe_id,
+            "name": created["name"],
+            "servings": created["servings"],
+            "source_url": created["source_url"],
+            "steps": steps.len(),
+            "ingredients": ingredient_count,
+            "keywords": created["keywords"]
+                .as_array()
+                .map(|k| k.iter().map(|k| k["name"].clone()).collect::<Vec<_>>()),
+            "image": image,
+            "possible_duplicates": possible_duplicates,
+            "message": "Recipe imported and saved",
+        }))
     }
 
     // Shopping list tools
@@ -2580,7 +2677,7 @@ impl TandoorMcpServer {
                     })
                     .collect();
 
-                let result = if params.format == "grouped" {
+                let result = if params.format == ShoppingListFormat::Grouped {
                     let mut unchecked = Vec::new();
                     let mut checked = Vec::new();
 
@@ -2960,6 +3057,31 @@ impl TandoorMcpServer {
         };
         check_plan_range(from_date, to_date)?;
 
+        // Tandoor answers an unknown meal type with a bare 500, so check it first
+        if let Ok(types) = client.get_meal_types().await {
+            if !types.results.iter().any(|mt| mt.id == params.meal_type) {
+                let available: Vec<serde_json::Value> = types
+                    .results
+                    .iter()
+                    .map(|mt| json!({"id": mt.id, "name": mt.name}))
+                    .collect();
+                let suggestion = if available.is_empty() {
+                    "No meal types exist yet; create one with create_meal_type (e.g. \"Dinner\")"
+                } else {
+                    "Use one of the available meal type IDs, or create one with create_meal_type"
+                };
+                return Ok(CallToolResult::error(vec![Content::text(
+                    json!({
+                        "error": format!("Meal type {} does not exist", params.meal_type),
+                        "available_meal_types": available,
+                        "suggestion": suggestion,
+                        "success": false
+                    })
+                    .to_string(),
+                )]));
+            }
+        }
+
         let request = crate::client::types::CreateMealPlanRequest {
             recipe: params.recipe_id,
             title: params.title,
@@ -3146,7 +3268,61 @@ impl TandoorMcpServer {
     }
 
     #[tool(
-        description = "Get available meal types",
+        description = "Create a meal type (e.g. Breakfast, Lunch, Dinner) for meal plans. If one with the same name exists, Tandoor returns it instead of creating a duplicate.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn create_meal_type(
+        &self,
+        Parameters(params): Parameters<CreateMealTypeParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let client = auth_or_return!(self);
+        let name = params.name.trim();
+        if name.is_empty() {
+            return Err(McpError::invalid_params("name must not be empty", None));
+        }
+        let mut body = json!({"name": name});
+        if let Some(time) = params
+            .time
+            .as_deref()
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+        {
+            let parsed = chrono::NaiveTime::parse_from_str(time, "%H:%M")
+                .or_else(|_| chrono::NaiveTime::parse_from_str(time, "%H:%M:%S"))
+                .map_err(|_| {
+                    McpError::invalid_params(
+                        "Invalid time: expected HH:MM",
+                        Some(json!({"value": time})),
+                    )
+                })?;
+            body["time"] = json!(parsed.format("%H:%M:%S").to_string());
+        }
+        if let Some(color) = params
+            .color
+            .as_deref()
+            .map(str::trim)
+            .filter(|c| !c.is_empty())
+        {
+            body["color"] = json!(color);
+        }
+        match client.api_create("meal-type", body).await {
+            Ok(mt) => tool_ok(json!({
+                "id": mt["id"],
+                "name": mt["name"],
+                "time": mt["time"],
+                "color": mt["color"]
+            })),
+            Err(e) => tool_err("Failed to create meal type", e),
+        }
+    }
+
+    #[tool(
+        description = "Get available meal types (IDs for create_meal_plan). A new Tandoor has none; add them with create_meal_type",
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn get_meal_types(&self) -> Result<CallToolResult, McpError> {
@@ -3638,15 +3814,22 @@ impl TandoorMcpServer {
                     };
 
                     // Always patch: Tandoor's create returns an already-existing food unchanged
-                    match client
-                        .update_food_availability(food_id, item.available)
-                        .await
+                    let mut patch = json!({"food_onhand": item.available});
+                    if let Some(category) = item
+                        .supermarket_category
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|c| !c.is_empty())
                     {
+                        patch["supermarket_category"] = json!({"name": category});
+                    }
+                    match client.api_update("food", food_id as i64, patch).await {
                         Ok(updated_food) => {
                             updated.push(json!({
-                                "id": updated_food.id,
-                                "name": updated_food.name,
-                                "available": updated_food.food_onhand,
+                                "id": updated_food["id"],
+                                "name": updated_food["name"],
+                                "available": updated_food["food_onhand"],
+                                "category": updated_food["supermarket_category"]["name"],
                                 "status": if created { "created" } else { "updated" }
                             }));
                         }
@@ -3711,19 +3894,36 @@ impl TandoorMcpServer {
             .await
         {
             Ok(response) => {
+                // Current Tandoor only sends recipe IDs, so look each name up once
+                let mut names: std::collections::HashMap<i32, Option<String>> =
+                    std::collections::HashMap::new();
+                for log in &response.results {
+                    if log.recipe_name().is_some() {
+                        continue;
+                    }
+                    let Some(id) = log.recipe_id() else { continue };
+                    if let std::collections::hash_map::Entry::Vacant(slot) = names.entry(id) {
+                        slot.insert(client.get_recipe(id).await.ok().map(|r| r.name));
+                    }
+                }
                 let cook_log_json: Vec<serde_json::Value> = response
                     .results
-                    .into_iter()
+                    .iter()
                     .map(|log| {
+                        let recipe_id = log.recipe_id();
+                        let recipe_name = log
+                            .recipe_name()
+                            .map(str::to_string)
+                            .or_else(|| recipe_id.and_then(|id| names.get(&id).cloned().flatten()));
                         json!({
                             "id": log.id,
-                            "recipe_id": log.recipe.id,
-                            "recipe_name": log.recipe.name,
+                            "recipe_id": recipe_id,
+                            "recipe_name": recipe_name,
                             "servings": log.servings,
                             "rating": log.rating,
                             "comment": log.comment,
-                            "created": log.created,
-                            "date_cooked": log.created.format("%Y-%m-%d").to_string()
+                            "created": log.created_at,
+                            "date_cooked": log.date()
                         })
                     })
                     .collect();
@@ -3789,14 +3989,22 @@ impl TandoorMcpServer {
 
         match client.log_cooked_recipe(request).await {
             Ok(cook_log) => {
+                let recipe_name = match cook_log.recipe_name() {
+                    Some(name) => Some(name.to_string()),
+                    None => client
+                        .get_recipe(params.recipe_id)
+                        .await
+                        .ok()
+                        .map(|r| r.name),
+                };
                 let result = json!({
                     "id": cook_log.id,
-                    "recipe_id": cook_log.recipe.id,
-                    "recipe_name": cook_log.recipe.name,
+                    "recipe_id": cook_log.recipe_id(),
+                    "recipe_name": recipe_name,
                     "servings": cook_log.servings,
                     "rating": cook_log.rating,
                     "comment": cook_log.comment,
-                    "created": cook_log.created,
+                    "created": cook_log.created_at,
                     "success": true,
                     "message": "Recipe cooking logged successfully"
                 });
@@ -3993,7 +4201,7 @@ impl TandoorMcpServer {
     }
 
     #[tool(
-        description = "Update an existing recipe. Top-level fields (name, description, servings, cooking_time, waiting_time, source_url, source_title) change only what you pass. Keywords/tags: `add_keywords` / `remove_keywords` (by name) change just those; `replace_all_keywords` is a FULL REPLACEMENT of the keyword list. To edit steps, call get_recipe_details first and refer to steps by their step_number: `step_updates` edits specific steps and their ingredients (add_ingredients, remove_ingredients, update_ingredients to change an amount/unit/note/food in place, or replace_ingredients), `add_steps` inserts new steps, `move_steps` reorders, `remove_steps` deletes; all other steps stay untouched. An ingredient entry of {\"header\": \"For the sauce\"} is a section heading. `replace_all_steps` is a FULL REPLACEMENT that deletes every existing step and ingredient — only use it to rewrite the whole recipe. Returns the recipe's resulting steps so you can verify.",
+        description = "Update an existing recipe. Top-level fields (name, description, servings, cooking_time, waiting_time, source_url) change only what you pass. Keywords/tags: `add_keywords` / `remove_keywords` (by name) change just those; `replace_all_keywords` is a FULL REPLACEMENT of the keyword list. To edit steps, call get_recipe_details first and refer to steps by their step_number: `step_updates` edits specific steps and their ingredients (add_ingredients, remove_ingredients, update_ingredients to change an amount/unit/note/food in place, or replace_ingredients), `add_steps` inserts new steps, `move_steps` reorders, `remove_steps` deletes; all other steps stay untouched. An ingredient entry of {\"header\": \"For the sauce\"} is a section heading. `replace_all_steps` is a FULL REPLACEMENT that deletes every existing step and ingredient — only use it to rewrite the whole recipe. Returns the recipe's resulting steps so you can verify.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -4033,9 +4241,6 @@ impl TandoorMcpServer {
         }
         if let Some(v) = params.source_url {
             body.insert("source_url".to_string(), json!(v));
-        }
-        if let Some(v) = params.source_title {
-            body.insert("source_title".to_string(), json!(v));
         }
         let reject = |message: String| {
             Ok(CallToolResult::error(vec![Content::text(
@@ -4651,7 +4856,11 @@ impl TandoorMcpServer {
                     "recipe": recipe.name,
                     "added": [],
                     "skipped_on_hand": skipped_on_hand,
-                    "message": "Nothing to add: every ingredient is already on hand"
+                    "message": if skipped_on_hand.is_empty() {
+                        "Nothing to add: the recipe has no ingredients"
+                    } else {
+                        "Nothing to add: every ingredient is already on hand"
+                    }
                 }))
                 .unwrap(),
             )]));
@@ -5584,7 +5793,7 @@ impl ServerHandler for TandoorMcpServer {
                 WRITE tools (modify data — confirm intent before calling): create_recipe, \
                 import_recipe_from_url, update_recipe, add_to_shopping_list, \
                 check_shopping_items, update_shopping_list_item, \
-                update_pantry, create_meal_plan, update_meal_plan, log_cooked_recipe, \
+                update_pantry, create_meal_plan, create_meal_type, update_meal_plan, log_cooked_recipe, \
                 create_recipe_book, update_recipe_book, add_to_recipe_book, \
                 add_meal_plan_to_shopping_list, add_recipe_to_shopping_list, \
                 create_shopping_list, update_shopping_list, update_shopping_list_recipe, \
@@ -6197,13 +6406,36 @@ mod tests {
 }
 
 #[cfg(test)]
+mod import_tests {
+    use super::*;
+
+    #[test]
+    fn prepare_parsed_recipe_fills_null_orders() {
+        let mut recipe = json!({
+            "name": "Pancakes",
+            "steps": [
+                {"instruction": "Mix", "ingredients": [
+                    {"food": {"name": "flour"}, "order": null},
+                    {"food": {"name": "milk"}, "order": null}
+                ]},
+                {"instruction": "Fry", "ingredients": []}
+            ]
+        });
+        prepare_parsed_recipe(&mut recipe);
+        assert_eq!(recipe["steps"][0]["order"], 0);
+        assert_eq!(recipe["steps"][1]["order"], 1);
+        assert_eq!(recipe["steps"][0]["ingredients"][1]["order"], 1);
+    }
+}
+
+#[cfg(test)]
 mod annotation_tests {
     use super::*;
 
     #[test]
     fn every_tool_declares_annotations() {
         let tools = TandoorMcpServer::tool_router().list_all();
-        assert_eq!(tools.len(), 54, "unexpected tool count");
+        assert_eq!(tools.len(), 55, "unexpected tool count");
 
         for tool in &tools {
             let name = tool.name.as_ref();

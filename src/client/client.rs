@@ -897,56 +897,17 @@ impl TandoorClient {
         Ok(entry)
     }
 
+    /// Adds several entries one at a time. (Tandoor's `shopping-list-entry/bulk/`
+    /// endpoint only bulk-updates existing entries; it can't create them.)
     pub async fn add_bulk_to_shopping_list(
         &self,
         entries: Vec<CreateShoppingListEntryRequest>,
     ) -> Result<Vec<ShoppingListEntry>> {
-        let auth_header = self.get_auth_header()?;
-        let url = format!("{}/api/shopping-list-entry/bulk/", self.base_url);
-        let entry_count = entries.len();
-        tracing::debug!("Adding {} items to shopping list in bulk", entry_count);
-        tracing::trace!("Bulk shopping list items: {:?}", entries);
-
-        let request = BulkShoppingListRequest { entries };
-
-        let response = self
-            .client
-            .post(&url)
-            .header("Authorization", auth_header)
-            .json(&request)
-            .send()
-            .await
-            .map_err(|e| {
-                tracing::error!("Network error adding bulk items to shopping list: {}", e);
-                anyhow::anyhow!("Failed to connect to Tandoor API: {e}")
-            })?;
-
-        let status = response.status();
-        tracing::trace!("Bulk add response status: {}", status);
-
-        if !status.is_success() {
-            let error_body = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "Unable to read error response".to_string());
-            tracing::error!(
-                "Failed to add bulk items with status {}: {}",
-                status,
-                error_body
-            );
-            anyhow::bail!("Failed to add bulk to shopping list: {status} - {error_body}");
+        let mut added = Vec::with_capacity(entries.len());
+        for entry in entries {
+            added.push(self.add_to_shopping_list(entry).await?);
         }
-
-        let entries: Vec<ShoppingListEntry> = response.json().await.map_err(|e| {
-            tracing::error!("Failed to parse bulk add response: {}", e);
-            anyhow::anyhow!("Invalid response format: {e}")
-        })?;
-
-        tracing::info!(
-            "Successfully added {} items to shopping list",
-            entries.len()
-        );
-        Ok(entries)
+        Ok(added)
     }
 
     pub async fn update_shopping_list_entry(

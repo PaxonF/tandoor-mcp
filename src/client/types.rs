@@ -453,12 +453,38 @@ pub struct MealType {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CookLog {
     pub id: i32,
-    pub recipe: Recipe,
-    pub servings: i32,
+    /// Recipe ID (current Tandoor) or a nested recipe object (older versions)
+    pub recipe: serde_json::Value,
+    #[serde(default)]
+    pub servings: Option<i32>,
+    #[serde(default)]
     pub rating: Option<i32>,
+    #[serde(default)]
     pub comment: Option<String>,
-    pub created: DateTime<Utc>,
+    /// Local datetime, e.g. `2026-10-14T15:26:00.776588-04:00`
+    #[serde(alias = "created")]
+    pub created_at: String,
+    #[serde(default)]
     pub created_by: serde_json::Value,
+}
+
+impl CookLog {
+    pub fn recipe_id(&self) -> Option<i32> {
+        match &self.recipe {
+            serde_json::Value::Number(n) => n.as_i64().map(|id| id as i32),
+            other => other.get("id")?.as_i64().map(|id| id as i32),
+        }
+    }
+
+    /// Recipe name when Tandoor nests the recipe; current versions only send the ID.
+    pub fn recipe_name(&self) -> Option<&str> {
+        self.recipe.get("name")?.as_str()
+    }
+
+    /// Date cooked as `YYYY-MM-DD`, in the Tandoor server's timezone.
+    pub fn date(&self) -> &str {
+        local_date(&self.created_at)
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -600,11 +626,6 @@ pub struct UpdateShoppingListEntryRequest {
     pub checked: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub amount: Option<f64>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct BulkShoppingListRequest {
-    pub entries: Vec<CreateShoppingListEntryRequest>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
