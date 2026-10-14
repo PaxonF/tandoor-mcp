@@ -4,7 +4,7 @@
 //! correctly handle the API response shapes we've observed in the wild, including
 //! the `created_by` field that ships as a full user object rather than an integer.
 
-use mcp_tandoor::client::{MealPlan, MealType, PaginatedResponse, Recipe};
+use mcp_tandoor::client::{CookLog, MealPlan, MealType, PaginatedResponse, Recipe};
 
 // ── Recipe deserialization ────────────────────────────────────────────────────
 
@@ -225,4 +225,28 @@ fn create_meal_plan_request_omits_unset_fields() {
             "to_date": "2026-10-19", "meal_type": 1
         })
     );
+}
+
+// ── CookLog deserialization ───────────────────────────────────────────────────
+
+#[test]
+fn cook_log_current_tandoor_shape() {
+    // Current Tandoor sends the recipe as an ID and the timestamp as created_at
+    let json = r#"{"id": 2, "recipe": 1, "servings": 2, "rating": 4, "comment": "tasty",
+        "created_by": {"id": 1, "username": "admin"},
+        "created_at": "2026-10-14T15:26:00.776588-04:00", "updated_at": "2026-10-14T15:26:00.776717-04:00"}"#;
+    let log: CookLog = serde_json::from_str(json).expect("should deserialize current cook log");
+    assert_eq!(log.recipe_id(), Some(1));
+    assert_eq!(log.recipe_name(), None);
+    assert_eq!(log.date(), "2026-10-14");
+}
+
+#[test]
+fn cook_log_nested_recipe_shape() {
+    let json = r#"{"id": 1, "recipe": {"id": 7, "name": "Soup"}, "servings": null,
+        "created": "2026-01-02T03:04:05Z"}"#;
+    let log: CookLog = serde_json::from_str(json).expect("should deserialize older cook log");
+    assert_eq!(log.recipe_id(), Some(7));
+    assert_eq!(log.recipe_name(), Some("Soup"));
+    assert_eq!(log.servings, None);
 }

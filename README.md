@@ -212,7 +212,7 @@ curl -X POST http://your-tandoor/api-token-auth/ \
 - `set_recipe_image` — Set a recipe's photo from a direct image URL (JPEG, PNG, WebP, or GIF); the server downloads and uploads it, replacing any existing photo
 - `remove_recipe_image` — Remove a recipe's photo
 - `delete_recipe` — Delete a recipe permanently
-- `import_recipe_from_url` — Import a recipe from an external URL
+- `import_recipe_from_url` — Import a recipe from an external URL and save it (steps, ingredients, keywords, source URL and photo); reports possible duplicates
 
 ### Recipe Books
 
@@ -254,7 +254,7 @@ Items are referred to by food name (e.g. `"lemons"`, plurals match) or entry ID;
 ### Food & Inventory
 
 - `search_foods` — Search for foods/ingredients with fuzzy name matching
-- `update_pantry` — Mark foods on hand / not on hand (Tandoor tracks on-hand status, not quantities). Matches existing foods by exact name or plural (case-insensitive) and creates foods that don't exist yet when marked available (optional `supermarket_category`; disable with `create_missing: false`)
+- `update_pantry` — Mark foods on hand / not on hand (Tandoor tracks on-hand status, not quantities). Matches existing foods by exact name or plural (case-insensitive) and creates foods that don't exist yet when marked available (disable with `create_missing: false`). Optional `supermarket_category` is set on the food
 - `find_duplicate_foods` — List foods that look like duplicates (same name apart from case, spacing, or a simple plural)
 - `merge_foods` — Merge one food into another by ID; recipes and shopping entries move to the target and the source food is **deleted**
 - `suggest_from_inventory` — Get recipe suggestions based on current inventory
@@ -263,10 +263,11 @@ Items are referred to by food name (e.g. `"lemons"`, plurals match) or entry ID;
 ### Meal Planning
 
 - `get_meal_plans` — Get meal plans for a date range
-- `create_meal_plan` — Create a new meal plan
-- `update_meal_plan` — Update fields on an existing meal plan (recipe, title, servings, date, meal_type, note) without deleting and recreating it
+- `create_meal_plan` — Create a meal plan for a recipe or free-text title; optional `end_date` for multi-day plans
+- `update_meal_plan` — Update fields on an existing meal plan (recipe, title, servings, date, end_date, meal_type, note) without deleting and recreating it
 - `delete_meal_plan` — Delete a meal plan
 - `get_meal_types` — Get available meal types
+- `create_meal_type` — Create a meal type (e.g. Breakfast, Dinner) with an optional default time and color; a new Tandoor has none
 
 ### Metadata
 
