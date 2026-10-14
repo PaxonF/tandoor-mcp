@@ -829,6 +829,57 @@ impl TandoorClient {
         Ok(serde_json::from_str(&text)?)
     }
 
+    // Inventory (the Pantry page). Older Tandoor versions don't have these endpoints
+    // and only track the per-food `food_onhand` flag.
+
+    /// Whether this Tandoor instance has the Inventory API. A 404 means it predates it.
+    pub async fn inventory_supported(&self) -> Result<bool> {
+        let auth_header = self.get_auth_header()?;
+        let url = format!("{}/api/inventory-location/?page_size=1", self.base_url);
+        let response = self
+            .client
+            .get(&url)
+            .header("Authorization", auth_header)
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to connect to Tandoor API: {e}"))?;
+        let status = response.status();
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Ok(false);
+        }
+        if !status.is_success() {
+            let error_body = response.text().await.unwrap_or_default();
+            anyhow::bail!("Failed to check inventory support: {status} - {error_body}");
+        }
+        Ok(true)
+    }
+
+    pub async fn list_inventory_locations(&self) -> Result<Vec<InventoryLocation>> {
+        self.api_list_all("inventory-location")
+            .await?
+            .into_iter()
+            .map(|v| Ok(serde_json::from_value(v)?))
+            .collect()
+    }
+
+    pub async fn list_inventory_entries(&self) -> Result<Vec<InventoryEntry>> {
+        self.api_list_all("inventory-entry")
+            .await?
+            .into_iter()
+            .map(|v| Ok(serde_json::from_value(v)?))
+            .collect()
+    }
+
+    /// Every unit in the space, following pagination.
+    pub async fn list_all_units(&self) -> Result<Vec<Unit>> {
+        Ok(self
+            .api_list_all("unit")
+            .await?
+            .into_iter()
+            .filter_map(|v| serde_json::from_value(v).ok())
+            .collect())
+    }
+
     /// Every shopping list entry, following pagination.
     pub async fn get_all_shopping_entries(&self) -> Result<Vec<ShoppingListEntry>> {
         let auth_header = self.get_auth_header()?;

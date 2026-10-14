@@ -1203,6 +1203,22 @@ pub struct UpdatePantryItem {
     /// Supermarket category to assign (e.g. "Produce"); created if it doesn't exist
     #[serde(default)]
     pub supermarket_category: Option<String>,
+    /// Pantry location to store it in (default "Pantry"), e.g. "Fridge" or "Freezer";
+    /// created if it doesn't exist. Used when a new Pantry entry is created.
+    #[serde(default)]
+    pub location: Option<String>,
+    /// Shelf/section within the location, e.g. "Spices"
+    #[serde(default)]
+    pub sub_location: Option<String>,
+    /// Amount on hand (default 1 for new entries)
+    #[serde(default)]
+    pub amount: Option<f64>,
+    /// Unit for the amount, e.g. "jar" or "lb" (default "pcs" for new entries)
+    #[serde(default)]
+    pub unit: Option<String>,
+    /// Expiry date, YYYY-MM-DD
+    #[serde(default)]
+    pub expires: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -1211,6 +1227,271 @@ pub struct UpdatePantryParams {
     /// Create foods that don't exist yet when marking them available (default true)
     #[serde(default)]
     pub create_missing: Option<bool>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct GetInventoryParams {
+    /// Only this location, e.g. "Fridge" (case-insensitive)
+    #[serde(default)]
+    pub location: Option<String>,
+    /// Only entries that expire within this many days (including already expired ones)
+    #[serde(default)]
+    pub expiring_within_days: Option<i64>,
+}
+
+const DEFAULT_INVENTORY_LOCATION: &str = "Pantry";
+const DEFAULT_INVENTORY_UNIT: &str = "pcs";
+
+/// The location name to use for an item: the one given, or "Pantry".
+fn inventory_location_name(location: Option<&str>) -> &str {
+    location
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .unwrap_or(DEFAULT_INVENTORY_LOCATION)
+}
+
+fn find_inventory_location<'a>(
+    locations: &'a [crate::client::types::InventoryLocation],
+    name: &str,
+) -> Option<&'a crate::client::types::InventoryLocation> {
+    let name = name.trim();
+    locations
+        .iter()
+        .find(|l| l.name.trim().eq_ignore_ascii_case(name))
+}
+
+/// What `update_pantry` should do to a food's Pantry entries.
+#[derive(Debug, PartialEq)]
+enum InventoryAction {
+    Create,
+    /// PATCH this entry with this body
+    Update(i32, serde_json::Value),
+    /// Delete these entries
+    Remove(Vec<i32>),
+    Unchanged,
+}
+
+/// Decides how to bring a food's Pantry entries in line with an `update_pantry` item.
+/// An existing entry is only changed for the fields the item actually sets, so marking
+/// a food available again never creates a duplicate. `unit` is the already-resolved
+/// unit name, if the item gave one.
+fn plan_inventory_action(
+    existing: &[&crate::client::types::InventoryEntry],
+    item: &UpdatePantryItem,
+    unit: Option<&str>,
+) -> InventoryAction {
+    if !item.available {
+        return if existing.is_empty() {
+            InventoryAction::Unchanged
+        } else {
+            InventoryAction::Remove(existing.iter().map(|e| e.id).collect())
+        };
+    }
+    let Some(entry) = existing.first() else {
+        return InventoryAction::Create;
+    };
+    let mut patch = serde_json::Map::new();
+    if let Some(amount) = item.amount {
+        if (amount - entry.amount).abs() > f64::EPSILON {
+            patch.insert("amount".into(), json!(amount));
+        }
+    }
+    if let Some(sub) = item.sub_location.as_deref().map(str::trim) {
+        if entry.sub_location.as_deref().unwrap_or("") != sub {
+            patch.insert("sub_location".into(), json!(sub));
+        }
+    }
+    if let Some(expires) = item.expires.as_deref().map(str::trim) {
+        if entry.expires.as_deref() != Some(expires) {
+            patch.insert("expires".into(), json!(expires));
+        }
+    }
+    if let Some(unit) = unit {
+        let same = entry
+            .unit
+            .as_ref()
+            .is_some_and(|u| u.name.eq_ignore_ascii_case(unit));
+        if !same {
+            patch.insert("unit".into(), json!({"name": unit}));
+        }
+    }
+    if patch.is_empty() {
+        InventoryAction::Unchanged
+    } else {
+        InventoryAction::Update(entry.id, serde_json::Value::Object(patch))
+    }
+}
+
+/// True if `expires` (YYYY-MM-DD) is on or before `today + days`. Already expired
+/// entries count; entries without a (valid) date never do.
+fn expires_within(expires: Option<&str>, today: chrono::NaiveDate, days: i64) -> bool {
+    expires
+        .and_then(|e| chrono::NaiveDate::parse_from_str(e.trim(), "%Y-%m-%d").ok())
+        .is_some_and(|date| date <= today + chrono::Duration::days(days))
+}
+
+/// Pantry state, loaded once per `update_pantry` call and kept current as it changes.
+struct PantryInventory {
+    locations: Vec<crate::client::types::InventoryLocation>,
+    entries: Vec<crate::client::types::InventoryEntry>,
+    units: Vec<crate::client::types::Unit>,
+    household: Option<serde_json::Value>,
+}
+
+impl PantryInventory {
+    async fn load(client: &TandoorClient) -> anyhow::Result<Self> {
+        Ok(Self {
+            locations: client.list_inventory_locations().await?,
+            entries: client.list_inventory_entries().await?,
+            units: client.list_all_units().await?,
+            household: None,
+        })
+    }
+
+    /// The location with this name, created under the user's household if it's new.
+    async fn location(
+        &mut self,
+        client: &TandoorClient,
+        name: &str,
+    ) -> anyhow::Result<crate::client::types::InventoryLocation> {
+        if let Some(location) = find_inventory_location(&self.locations, name) {
+            return Ok(location.clone());
+        }
+        if self.household.is_none() {
+            self.household = client.api_list_all("household").await?.into_iter().next();
+        }
+        let Some(household) = self.household.clone() else {
+            anyhow::bail!("No household found to create location '{name}' in");
+        };
+        let body = json!({
+            "name": name.trim(),
+            "is_freezer": name.to_lowercase().contains("freezer"),
+            "household": {"id": household["id"], "name": household["name"]},
+        });
+        let created: crate::client::types::InventoryLocation =
+            serde_json::from_value(client.api_create("inventory-location", body).await?)?;
+        self.locations.push(created.clone());
+        Ok(created)
+    }
+
+    /// Brings the food's Pantry entries in line with the item. Returns what happened
+    /// (created/updated/removed/unchanged) and the location involved, if any.
+    async fn apply(
+        &mut self,
+        client: &TandoorClient,
+        food_id: i32,
+        food_name: &str,
+        item: &UpdatePantryItem,
+    ) -> anyhow::Result<(&'static str, Option<String>)> {
+        let unit = item
+            .unit
+            .as_deref()
+            .map(str::trim)
+            .filter(|u| !u.is_empty())
+            .map(|u| resolve_unit_name(u, &self.units));
+        let (action, existing_location) = {
+            let existing: Vec<&crate::client::types::InventoryEntry> = self
+                .entries
+                .iter()
+                .filter(|e| e.food_id() == Some(food_id))
+                .collect();
+            (
+                plan_inventory_action(&existing, item, unit.as_deref()),
+                existing.first().map(|e| e.location_name().to_string()),
+            )
+        };
+
+        match action {
+            InventoryAction::Create => {
+                let location = self
+                    .location(client, inventory_location_name(item.location.as_deref()))
+                    .await?;
+                let unit =
+                    unit.unwrap_or_else(|| resolve_unit_name(DEFAULT_INVENTORY_UNIT, &self.units));
+                let mut body = json!({
+                    "inventory_location": location,
+                    "food": {"id": food_id, "name": food_name},
+                    "unit": {"name": unit},
+                    "amount": item.amount.unwrap_or(1.0),
+                });
+                if let Some(sub) = item.sub_location.as_deref().map(str::trim) {
+                    body["sub_location"] = json!(sub);
+                }
+                if let Some(expires) = item.expires.as_deref().map(str::trim) {
+                    body["expires"] = json!(expires);
+                }
+                let created = client.api_create("inventory-entry", body).await?;
+                self.entries.push(serde_json::from_value(created)?);
+                Ok(("created", Some(location.name)))
+            }
+            InventoryAction::Update(id, patch) => {
+                let updated: crate::client::types::InventoryEntry = serde_json::from_value(
+                    client
+                        .api_update("inventory-entry", id as i64, patch)
+                        .await?,
+                )?;
+                let location = updated.location_name().to_string();
+                if let Some(entry) = self.entries.iter_mut().find(|e| e.id == id) {
+                    *entry = updated;
+                }
+                Ok(("updated", Some(location)))
+            }
+            InventoryAction::Remove(ids) => {
+                for id in &ids {
+                    client.api_delete("inventory-entry", *id as i64).await?;
+                }
+                self.entries.retain(|e| !ids.contains(&e.id));
+                Ok(("removed", existing_location))
+            }
+            InventoryAction::Unchanged => Ok(("unchanged", existing_location)),
+        }
+    }
+}
+
+/// Groups Pantry entries by location, then sub-location, both sorted by name.
+fn group_inventory(entries: &[&crate::client::types::InventoryEntry]) -> serde_json::Value {
+    use std::collections::BTreeMap;
+    let mut groups: BTreeMap<String, (bool, BTreeMap<String, Vec<serde_json::Value>>)> =
+        BTreeMap::new();
+    for entry in entries {
+        let (_, subs) = groups
+            .entry(entry.location_name().to_string())
+            .or_insert_with(|| {
+                let freezer = entry
+                    .inventory_location
+                    .as_ref()
+                    .is_some_and(|l| l.is_freezer);
+                (freezer, BTreeMap::new())
+            });
+        subs.entry(entry.sub_location.clone().unwrap_or_default())
+            .or_default()
+            .push(json!({
+                "id": entry.id,
+                "food": entry.food.as_ref().map(|f| f.name.as_str()),
+                "amount": entry.amount,
+                "unit": entry.unit.as_ref().map(|u| u.name.as_str()),
+                "expires": entry.expires,
+                "note": entry.note,
+            }));
+    }
+    let locations: Vec<serde_json::Value> = groups
+        .into_iter()
+        .map(|(location, (is_freezer, subs))| {
+            let sub_locations: Vec<serde_json::Value> = subs
+                .into_iter()
+                .map(|(sub, mut items)| {
+                    items.sort_by(|a, b| {
+                        let name =
+                            |v: &serde_json::Value| v["food"].as_str().unwrap_or("").to_lowercase();
+                        name(a).cmp(&name(b))
+                    });
+                    json!({"sub_location": sub, "items": items})
+                })
+                .collect();
+            json!({"location": location, "is_freezer": is_freezer, "sub_locations": sub_locations})
+        })
+        .collect();
+    serde_json::Value::Array(locations)
 }
 
 /// Case-insensitive name match that also treats simple "s"/"es" plurals as equal,
@@ -3737,7 +4018,7 @@ impl TandoorMcpServer {
 
     // Inventory management tools
     #[tool(
-        description = "Update pantry inventory status (on hand / not on hand). Tandoor tracks only whether a food is on hand, not how much. Foods are matched by exact name or plural (case-insensitive); foods that don't exist yet are created when marked available, unless create_missing is false.",
+        description = "Mark foods as on hand or not, and keep Tandoor's Pantry in sync. available:true sets the food's on-hand flag and adds it to the Pantry (location defaults to \"Pantry\"; amount 1 and unit \"pcs\" unless given); if it's already in the Pantry, only the amount/unit/sub_location/expires you pass are updated, so no duplicates. available:false clears the flag and removes its Pantry entries. Foods are matched by exact name or plural (case-insensitive); foods that don't exist yet are created when marked available, unless create_missing is false. On Tandoor versions without the Pantry/Inventory feature only the on-hand flag changes.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -3749,118 +4030,196 @@ impl TandoorMcpServer {
         &self,
         Parameters(params): Parameters<UpdatePantryParams>,
     ) -> Result<CallToolResult, McpError> {
-        // Ensure we're authenticated before making API calls
-        let client = match self.ensure_authenticated().await {
-            Ok(client) => client,
-            Err(e) => {
-                tracing::error!("Authentication failed in update_pantry: {}", e);
-                let error = json!({
-                    "error": "Authentication Error",
-                    "message": "Failed to authenticate with Tandoor",
-                    "details": e.to_string(),
-                    "suggestion": "Check your Tandoor credentials and server connectivity"
-                });
-                return Ok(CallToolResult::error(vec![Content::text(
-                    serde_json::to_string_pretty(&error).unwrap(),
-                )]));
-            }
-        };
+        let client = auth_or_return!(self);
 
         let mut updated = Vec::new();
         let mut errors = Vec::new();
-
         let create_missing = params.create_missing.unwrap_or(true);
 
+        // Pantry entries, loaded once for the whole call
+        let mut inventory_note = None;
+        let mut inventory = match client.inventory_supported().await {
+            Ok(true) => match PantryInventory::load(&client).await {
+                Ok(inv) => Some(inv),
+                Err(e) => return tool_err("Failed to load pantry inventory", e),
+            },
+            Ok(false) => {
+                inventory_note = Some(
+                    "This Tandoor version has no Pantry/Inventory API; only the on-hand flag was updated.",
+                );
+                None
+            }
+            Err(e) => return tool_err("Failed to check pantry inventory support", e),
+        };
+
         for item in params.items {
-            match find_food_by_name(&client, &item.food).await {
-                Ok((existing, candidates)) => {
-                    // Resolve to (food id, created), creating the food if allowed
-                    let resolved = match existing {
-                        Some(id) => Ok((id, false)),
-                        None if item.available && create_missing => {
-                            let request = crate::client::types::NewFoodRequest {
-                                name: item.food.trim().to_string(),
-                                food_onhand: true,
-                                supermarket_category: item.supermarket_category.clone().map(
-                                    |name| crate::client::types::SupermarketCategoryRef { name },
-                                ),
-                            };
-                            client
-                                .create_food(request)
-                                .await
-                                .map(|f| (f.id, true))
-                                .map_err(|e| {
-                                    json!({
-                                        "food": item.food,
-                                        "error": "Failed to create food",
-                                        "details": e.to_string()
-                                    })
-                                })
-                        }
-                        None => Err(json!({
-                            "food": item.food,
-                            "error": "Food not found",
-                            "similar_foods": candidates,
-                            "suggestion": "Use the exact name of an existing food, or mark it available with create_missing enabled to create it"
-                        })),
-                    };
-
-                    let (food_id, created) = match resolved {
-                        Ok(r) => r,
-                        Err(err) => {
-                            errors.push(err);
-                            continue;
-                        }
-                    };
-
-                    // Always patch: Tandoor's create returns an already-existing food unchanged
-                    let mut patch = json!({"food_onhand": item.available});
-                    if let Some(category) = item
-                        .supermarket_category
-                        .as_deref()
-                        .map(str::trim)
-                        .filter(|c| !c.is_empty())
-                    {
-                        patch["supermarket_category"] = json!({"name": category});
-                    }
-                    match client.api_update("food", food_id as i64, patch).await {
-                        Ok(updated_food) => {
-                            updated.push(json!({
-                                "id": updated_food["id"],
-                                "name": updated_food["name"],
-                                "available": updated_food["food_onhand"],
-                                "category": updated_food["supermarket_category"]["name"],
-                                "status": if created { "created" } else { "updated" }
-                            }));
-                        }
-                        Err(e) => {
-                            errors.push(json!({
-                                "food": item.food,
-                                "error": "Failed to update availability",
-                                "details": e.to_string()
-                            }));
-                        }
-                    }
+            if let Some(expires) = item.expires.as_deref() {
+                if chrono::NaiveDate::parse_from_str(expires.trim(), "%Y-%m-%d").is_err() {
+                    errors.push(json!({
+                        "food": item.food,
+                        "error": "Invalid expires date",
+                        "details": format!("'{expires}' is not YYYY-MM-DD")
+                    }));
+                    continue;
                 }
+            }
+
+            let (existing, candidates) = match find_food_by_name(&client, &item.food).await {
+                Ok(found) => found,
                 Err(e) => {
                     errors.push(json!({
                         "food": item.food,
                         "error": "Failed to search for food",
                         "details": e.to_string()
                     }));
+                    continue;
                 }
+            };
+
+            // Resolve to (food id, created), creating the food if allowed
+            let resolved = match existing {
+                Some(id) => Ok((id, false)),
+                None if item.available && create_missing => {
+                    let request = crate::client::types::NewFoodRequest {
+                        name: item.food.trim().to_string(),
+                        food_onhand: true,
+                        supermarket_category: item
+                            .supermarket_category
+                            .clone()
+                            .map(|name| crate::client::types::SupermarketCategoryRef { name }),
+                    };
+                    client
+                        .create_food(request)
+                        .await
+                        .map(|f| (f.id, true))
+                        .map_err(|e| {
+                            json!({
+                                "food": item.food,
+                                "error": "Failed to create food",
+                                "details": e.to_string()
+                            })
+                        })
+                }
+                None => Err(json!({
+                    "food": item.food,
+                    "error": "Food not found",
+                    "similar_foods": candidates,
+                    "suggestion": "Use the exact name of an existing food, or mark it available with create_missing enabled to create it"
+                })),
+            };
+            let (food_id, created) = match resolved {
+                Ok(r) => r,
+                Err(err) => {
+                    errors.push(err);
+                    continue;
+                }
+            };
+
+            // Always patch: Tandoor's create returns an already-existing food unchanged.
+            // The flag is still what recipes use for "on hand" checks.
+            let mut patch = json!({"food_onhand": item.available});
+            if let Some(category) = item
+                .supermarket_category
+                .as_deref()
+                .map(str::trim)
+                .filter(|c| !c.is_empty())
+            {
+                patch["supermarket_category"] = json!({"name": category});
             }
+            let updated_food = match client.api_update("food", food_id as i64, patch).await {
+                Ok(food) => food,
+                Err(e) => {
+                    errors.push(json!({
+                        "food": item.food,
+                        "error": "Failed to update availability",
+                        "details": e.to_string()
+                    }));
+                    continue;
+                }
+            };
+            let food_name = updated_food["name"].as_str().unwrap_or(item.food.trim());
+
+            let (inventory_status, location) = match inventory.as_mut() {
+                Some(inv) => match inv.apply(&client, food_id, food_name, &item).await {
+                    Ok(outcome) => outcome,
+                    Err(e) => {
+                        errors.push(json!({
+                            "food": item.food,
+                            "error": "Updated the on-hand flag but failed to update the Pantry entry",
+                            "details": e.to_string()
+                        }));
+                        ("failed", None)
+                    }
+                },
+                None => ("unsupported", None),
+            };
+
+            updated.push(json!({
+                "id": updated_food["id"],
+                "food": updated_food["name"],
+                "on_hand": updated_food["food_onhand"],
+                "category": updated_food["supermarket_category"]["name"],
+                "status": if created { "created" } else { "updated" },
+                "inventory": inventory_status,
+                "location": location,
+            }));
         }
 
-        let result = json!({
+        let mut result = json!({
             "updated": updated,
             "errors": errors,
             "summary": format!("Updated {} items, {} errors", updated.len(), errors.len())
         });
+        if let Some(note) = inventory_note {
+            result["note"] = json!(note);
+        }
+        tool_ok(result)
+    }
 
-        Ok(CallToolResult::success(vec![Content::text(
-            serde_json::to_string_pretty(&result).unwrap(),
-        )]))
+    #[tool(
+        description = "List what's in the Pantry (Tandoor's inventory), grouped by location and sub-location: food, amount, unit, and expiry date. Optionally filter by location or to items expiring within N days.",
+        annotations(read_only_hint = true, open_world_hint = false)
+    )]
+    async fn get_inventory(
+        &self,
+        Parameters(params): Parameters<GetInventoryParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let client = auth_or_return!(self);
+        match client.inventory_supported().await {
+            Ok(true) => {}
+            Ok(false) => {
+                return tool_err(
+                    "Inventory not supported",
+                    "This Tandoor version has no Pantry/Inventory API; use search_foods to see which foods are on hand",
+                )
+            }
+            Err(e) => return tool_err("Failed to check inventory support", e),
+        }
+        let entries = match client.list_inventory_entries().await {
+            Ok(e) => e,
+            Err(e) => return tool_err("Failed to get inventory", e),
+        };
+
+        let today = chrono::Local::now().date_naive();
+        let location = params
+            .location
+            .as_deref()
+            .map(str::trim)
+            .filter(|l| !l.is_empty());
+        let selected: Vec<&crate::client::types::InventoryEntry> = entries
+            .iter()
+            .filter(|e| location.is_none_or(|l| e.location_name().eq_ignore_ascii_case(l)))
+            .filter(|e| {
+                params
+                    .expiring_within_days
+                    .is_none_or(|days| expires_within(e.expires.as_deref(), today, days))
+            })
+            .collect();
+
+        tool_ok(json!({
+            "total": selected.len(),
+            "locations": group_inventory(&selected),
+        }))
     }
 
     // Recipe history tools
@@ -4027,177 +4386,182 @@ impl TandoorMcpServer {
     }
 
     #[tool(
-        description = "Get recipe suggestions based on current inventory",
+        description = "Get recipe suggestions based on what's on hand: foods in the Pantry plus foods flagged on hand. mode \"maximum-use\" (default) favours recipes that use the most of it; \"expiring\" only suggests recipes using Pantry items that expire within days_until_expiry days (default 3).",
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn suggest_from_inventory(
         &self,
         Parameters(params): Parameters<SuggestFromInventoryParams>,
     ) -> Result<CallToolResult, McpError> {
-        // Ensure we're authenticated before making API calls
-        let client = match self.ensure_authenticated().await {
-            Ok(client) => client,
-            Err(e) => {
-                tracing::error!("Authentication failed in suggest_from_inventory: {}", e);
-                let error = json!({
-                    "error": "Authentication Error",
-                    "message": "Failed to authenticate with Tandoor",
-                    "details": e.to_string(),
-                    "suggestion": "Check your Tandoor credentials and server connectivity"
-                });
-                return Ok(CallToolResult::error(vec![Content::text(
-                    serde_json::to_string_pretty(&error).unwrap(),
-                )]));
-            }
+        let client = auth_or_return!(self);
+
+        // On hand = every food flagged on hand, plus everything in the Pantry
+        let foods = match client.list_all_foods().await {
+            Ok(f) => f,
+            Err(e) => return tool_err("Failed to get inventory", e),
+        };
+        let entries = match client.inventory_supported().await {
+            Ok(true) => match client.list_inventory_entries().await {
+                Ok(e) => e,
+                Err(e) => return tool_err("Failed to get inventory", e),
+            },
+            Ok(false) => Vec::new(),
+            Err(e) => return tool_err("Failed to check inventory support", e),
+        };
+        let mut available: Vec<String> = foods
+            .iter()
+            .filter(|f| f.food_onhand || f.substitute_onhand)
+            .map(|f| f.name.clone())
+            .chain(
+                entries
+                    .iter()
+                    .filter_map(|e| e.food.as_ref())
+                    .map(|f| f.name.clone()),
+            )
+            .collect();
+        available.sort_by_key(|n| n.to_lowercase());
+        available.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
+        let available_set: std::collections::HashSet<String> =
+            available.iter().map(|n| n.to_lowercase()).collect();
+
+        let today = chrono::Local::now().date_naive();
+        let expiring_set: std::collections::HashSet<String> = entries
+            .iter()
+            .filter(|e| {
+                expires_within(e.expires.as_deref(), today, params.days_until_expiry as i64)
+            })
+            .filter_map(|e| e.food.as_ref().map(|f| f.name.to_lowercase()))
+            .collect();
+
+        if available.is_empty() {
+            return tool_ok(json!({
+                "suggestions": [],
+                "message": "No ingredients found in pantry. Update your inventory first.",
+                "mode": params.mode
+            }));
+        }
+        let expiring_mode = params.mode == "expiring";
+        if expiring_mode && expiring_set.is_empty() {
+            return tool_ok(json!({
+                "suggestions": [],
+                "message": format!(
+                    "Nothing in the Pantry expires within {} days.",
+                    params.days_until_expiry
+                ),
+                "mode": params.mode,
+                "total_available": available.len()
+            }));
+        }
+
+        let recipes = match client
+            .search_recipes(None, Some(20), None, None, None, None, None)
+            .await
+        {
+            Ok(r) => r.results,
+            Err(e) => return tool_err("Failed to search recipes", e),
         };
 
-        // Get available foods in pantry
-        match client.search_foods("", Some(100)).await {
-            Ok(foods_response) => {
-                let available_foods: Vec<&crate::client::types::Food> = foods_response
-                    .results
-                    .iter()
-                    .filter(|food| food.food_onhand || food.substitute_onhand)
-                    .collect();
+        let mut recipe_suggestions = Vec::new();
+        for recipe in recipes {
+            let Ok(detailed_recipe) = client.get_recipe(recipe.id).await else {
+                continue;
+            };
+            let mut matching_ingredients = 0;
+            let mut total_ingredients = 0;
+            let mut missing_ingredients = Vec::new();
+            let mut expiring_used = Vec::new();
 
-                if available_foods.is_empty() {
-                    let result = json!({
-                        "suggestions": [],
-                        "message": "No ingredients found in pantry. Update your inventory first.",
-                        "mode": params.mode
-                    });
-                    return Ok(CallToolResult::success(vec![Content::text(
-                        serde_json::to_string_pretty(&result).unwrap(),
-                    )]));
-                }
-
-                // Search for recipes that can use these ingredients
-                match client
-                    .search_recipes(None, Some(20), None, None, None, None, None)
-                    .await
-                {
-                    Ok(recipes_response) => {
-                        let mut recipe_suggestions = Vec::new();
-
-                        for recipe in recipes_response.results {
-                            // Get recipe details to check ingredients
-                            if let Ok(detailed_recipe) = client.get_recipe(recipe.id).await {
-                                let mut matching_ingredients = 0;
-                                let mut total_ingredients = 0;
-                                let mut missing_ingredients = Vec::new();
-
-                                for step in &detailed_recipe.steps {
-                                    for ingredient in &step.ingredients {
-                                        if !ingredient.is_header && !ingredient.no_amount {
-                                            total_ingredients += 1;
-
-                                            let ingredient_available =
-                                                available_foods.iter().any(|food| {
-                                                    food.name.to_lowercase()
-                                                        == ingredient.food_name().to_lowercase()
-                                                });
-
-                                            if ingredient_available {
-                                                matching_ingredients += 1;
-                                            } else {
-                                                missing_ingredients
-                                                    .push(ingredient.food_name().to_string());
-                                            }
-                                        }
-                                    }
-                                }
-
-                                if total_ingredients > 0 {
-                                    let match_percentage = (matching_ingredients as f64
-                                        / total_ingredients as f64)
-                                        * 100.0;
-
-                                    // Filter based on mode
-                                    let should_include = match params.mode.as_str() {
-                                        "maximum-use" => match_percentage >= 50.0, // At least 50% match
-                                        "expiring" => {
-                                            match_percentage >= 30.0
-                                                && missing_ingredients.len() <= 3
-                                        } // Good match with few missing items
-                                        _ => match_percentage >= 60.0,
-                                    };
-
-                                    if should_include {
-                                        let reason = if params.mode == "expiring" {
-                                            format!("Uses {:.0}% of pantry ingredients, only {} missing items", match_percentage, missing_ingredients.len())
-                                        } else {
-                                            format!(
-                                                "Uses {match_percentage:.0}% of available ingredients"
-                                            )
-                                        };
-
-                                        recipe_suggestions.push(json!({
-                                            "recipe_id": recipe.id,
-                                            "recipe_name": recipe.name,
-                                            "match_percentage": match_percentage,
-                                            "matching_ingredients": matching_ingredients,
-                                            "total_ingredients": total_ingredients,
-                                            "missing_ingredients": missing_ingredients,
-                                            "reason": reason,
-                                            "total_time": recipe.working_time.unwrap_or(0) + recipe.waiting_time.unwrap_or(0)
-                                        }));
-                                    }
-                                }
-                            }
+            for step in &detailed_recipe.steps {
+                for ingredient in &step.ingredients {
+                    if ingredient.is_header || ingredient.no_amount {
+                        continue;
+                    }
+                    total_ingredients += 1;
+                    let name = ingredient.food_name().to_lowercase();
+                    if available_set.contains(&name) {
+                        matching_ingredients += 1;
+                        if expiring_set.contains(&name) {
+                            expiring_used.push(ingredient.food_name().to_string());
                         }
-
-                        // Sort by match percentage
-                        recipe_suggestions.sort_by(|a, b| {
-                            let a_match = a
-                                .get("match_percentage")
-                                .and_then(|v| v.as_f64())
-                                .unwrap_or(0.0);
-                            let b_match = b
-                                .get("match_percentage")
-                                .and_then(|v| v.as_f64())
-                                .unwrap_or(0.0);
-                            b_match
-                                .partial_cmp(&a_match)
-                                .unwrap_or(std::cmp::Ordering::Equal)
-                        });
-
-                        // Take top 10
-                        recipe_suggestions.truncate(10);
-
-                        let result = json!({
-                            "suggestions": recipe_suggestions,
-                            "available_ingredients": available_foods.iter().map(|f| &f.name).collect::<Vec<_>>(),
-                            "mode": params.mode,
-                            "total_available": available_foods.len(),
-                            "message": format!("Found {} recipe suggestions using your {} available ingredients",
-                                recipe_suggestions.len(), available_foods.len())
-                        });
-
-                        Ok(CallToolResult::success(vec![Content::text(
-                            serde_json::to_string_pretty(&result).unwrap(),
-                        )]))
-                    }
-                    Err(e) => {
-                        let error = json!({
-                            "error": "Failed to search recipes",
-                            "details": e.to_string()
-                        });
-                        Ok(CallToolResult::error(vec![Content::text(
-                            error.to_string(),
-                        )]))
+                    } else {
+                        missing_ingredients.push(ingredient.food_name().to_string());
                     }
                 }
             }
-            Err(e) => {
-                let error = json!({
-                    "error": "Failed to get inventory",
-                    "details": e.to_string()
-                });
-                Ok(CallToolResult::error(vec![Content::text(
-                    error.to_string(),
-                )]))
+            if total_ingredients == 0 {
+                continue;
             }
+
+            let match_percentage = (matching_ingredients as f64 / total_ingredients as f64) * 100.0;
+            let should_include = match params.mode.as_str() {
+                "maximum-use" => match_percentage >= 50.0,
+                "expiring" => !expiring_used.is_empty(),
+                _ => match_percentage >= 60.0,
+            };
+            if !should_include {
+                continue;
+            }
+
+            let reason = if expiring_mode {
+                format!(
+                    "Uses {} soon-to-expire item(s) ({}); {} missing items",
+                    expiring_used.len(),
+                    expiring_used.join(", "),
+                    missing_ingredients.len()
+                )
+            } else {
+                format!("Uses {match_percentage:.0}% of available ingredients")
+            };
+            recipe_suggestions.push(json!({
+                "recipe_id": recipe.id,
+                "recipe_name": recipe.name,
+                "match_percentage": match_percentage,
+                "matching_ingredients": matching_ingredients,
+                "total_ingredients": total_ingredients,
+                "missing_ingredients": missing_ingredients,
+                "expiring_ingredients": expiring_used,
+                "reason": reason,
+                "total_time": recipe.working_time.unwrap_or(0) + recipe.waiting_time.unwrap_or(0)
+            }));
         }
+
+        // Most expiring items used first (expiring mode), then best match
+        recipe_suggestions.sort_by(|a, b| {
+            let key = |v: &serde_json::Value| {
+                (
+                    v["expiring_ingredients"].as_array().map_or(0, Vec::len),
+                    v["match_percentage"].as_f64().unwrap_or(0.0),
+                )
+            };
+            let (a_exp, a_match) = key(a);
+            let (b_exp, b_match) = key(b);
+            let by_expiring = if expiring_mode {
+                b_exp.cmp(&a_exp)
+            } else {
+                std::cmp::Ordering::Equal
+            };
+            by_expiring.then(
+                b_match
+                    .partial_cmp(&a_match)
+                    .unwrap_or(std::cmp::Ordering::Equal),
+            )
+        });
+        recipe_suggestions.truncate(10);
+
+        let mut result = json!({
+            "suggestions": recipe_suggestions,
+            "available_ingredients": available,
+            "mode": params.mode,
+            "total_available": available.len(),
+            "message": format!("Found {} recipe suggestions using your {} available ingredients",
+                recipe_suggestions.len(), available.len())
+        });
+        if expiring_mode {
+            let mut expiring: Vec<&String> = expiring_set.iter().collect();
+            expiring.sort();
+            result["expiring_soon"] = json!(expiring);
+        }
+        tool_ok(result)
     }
 
     #[tool(
@@ -5789,7 +6153,7 @@ impl ServerHandler for TandoorMcpServer {
                 get_shopping_list, search_foods, get_keywords, get_units, get_meal_plans, \
                 get_meal_types, get_cook_log, suggest_from_inventory, get_recipe_books, \
                 get_recipe_book_entries, get_supermarkets, get_unit_conversions, find_duplicate_foods, \
-                get_shopping_lists, get_shopping_list_recipes, get_supermarket_categories. \
+                get_shopping_lists, get_shopping_list_recipes, get_supermarket_categories, get_inventory. \
                 WRITE tools (modify data — confirm intent before calling): create_recipe, \
                 import_recipe_from_url, update_recipe, add_to_shopping_list, \
                 check_shopping_items, update_shopping_list_item, \
@@ -6285,6 +6649,153 @@ mod tests {
         assert_eq!(resolve_unit_name("sleeve", &units), "sleeve");
     }
 
+    fn inventory_entry(
+        id: i32,
+        food_id: i32,
+        food: &str,
+        location: &str,
+        expires: Option<&str>,
+    ) -> crate::client::types::InventoryEntry {
+        serde_json::from_value(json!({
+            "id": id,
+            "inventory_location": {"id": 1, "name": location, "is_freezer": location == "Freezer",
+                "household": {"id": 1, "name": "Home"}},
+            "sub_location": if food == "garlic" { json!("Produce") } else { json!(null) },
+            "food": {"id": food_id, "name": food},
+            "unit": {"id": 9, "name": "pcs"},
+            "amount": 1.0,
+            "expires": expires,
+            "note": null
+        }))
+        .unwrap()
+    }
+
+    fn pantry_item(available: bool) -> UpdatePantryItem {
+        UpdatePantryItem {
+            food: "garlic".into(),
+            available,
+            supermarket_category: None,
+            location: None,
+            sub_location: None,
+            amount: None,
+            unit: None,
+            expires: None,
+        }
+    }
+
+    #[test]
+    fn inventory_location_defaults_to_pantry_and_matches_case_insensitively() {
+        assert_eq!(inventory_location_name(None), "Pantry");
+        assert_eq!(inventory_location_name(Some("  ")), "Pantry");
+        assert_eq!(inventory_location_name(Some(" Fridge ")), "Fridge");
+
+        let locations: Vec<crate::client::types::InventoryLocation> = serde_json::from_value(json!([
+            {"id": 1, "name": "Pantry", "is_freezer": false, "household": {"id": 1, "name": "Home"}},
+            {"id": 3, "name": "Freezer", "is_freezer": true, "household": {"id": 1, "name": "Home"}}
+        ]))
+        .unwrap();
+        assert_eq!(
+            find_inventory_location(&locations, "freezer").map(|l| l.id),
+            Some(3)
+        );
+        assert_eq!(
+            find_inventory_location(&locations, " PANTRY").map(|l| l.id),
+            Some(1)
+        );
+        assert!(find_inventory_location(&locations, "Fridge").is_none());
+    }
+
+    #[test]
+    fn plan_inventory_action_creates_only_when_missing() {
+        let entry = inventory_entry(5, 776, "garlic", "Pantry", None);
+        assert_eq!(
+            plan_inventory_action(&[], &pantry_item(true), None),
+            InventoryAction::Create
+        );
+        // Already in the pantry and nothing new given: no duplicate, no change
+        assert_eq!(
+            plan_inventory_action(&[&entry], &pantry_item(true), None),
+            InventoryAction::Unchanged
+        );
+        // Same values as stored: still unchanged
+        let mut same = pantry_item(true);
+        same.amount = Some(1.0);
+        same.sub_location = Some("Produce".into());
+        assert_eq!(
+            plan_inventory_action(&[&entry], &same, Some("PCS")),
+            InventoryAction::Unchanged
+        );
+    }
+
+    #[test]
+    fn plan_inventory_action_updates_only_given_fields() {
+        let entry = inventory_entry(5, 776, "garlic", "Pantry", None);
+        let mut item = pantry_item(true);
+        item.amount = Some(3.0);
+        item.expires = Some("2026-11-01".into());
+        item.location = Some("Fridge".into());
+        assert_eq!(
+            plan_inventory_action(&[&entry], &item, Some("head")),
+            InventoryAction::Update(
+                5,
+                json!({"amount": 3.0, "expires": "2026-11-01", "unit": {"name": "head"}})
+            )
+        );
+    }
+
+    #[test]
+    fn plan_inventory_action_removes_all_entries_when_unavailable() {
+        let a = inventory_entry(5, 776, "garlic", "Pantry", None);
+        let b = inventory_entry(6, 776, "garlic", "Fridge", None);
+        assert_eq!(
+            plan_inventory_action(&[&a, &b], &pantry_item(false), None),
+            InventoryAction::Remove(vec![5, 6])
+        );
+        assert_eq!(
+            plan_inventory_action(&[], &pantry_item(false), None),
+            InventoryAction::Unchanged
+        );
+    }
+
+    #[test]
+    fn expires_within_counts_expired_and_skips_undated() {
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 10, 14).unwrap();
+        assert!(expires_within(Some("2026-10-17"), today, 3));
+        assert!(expires_within(Some("2026-10-01"), today, 3));
+        assert!(!expires_within(Some("2026-10-18"), today, 3));
+        assert!(!expires_within(None, today, 3));
+        assert!(!expires_within(Some("soon"), today, 3));
+    }
+
+    #[test]
+    fn group_inventory_nests_location_then_sub_location() {
+        let entries = [
+            inventory_entry(1, 776, "garlic", "Pantry", None),
+            inventory_entry(2, 10, "rice", "Pantry", None),
+            inventory_entry(3, 11, "peas", "Freezer", Some("2027-01-01")),
+            inventory_entry(4, 12, "beans", "Pantry", None),
+        ];
+        let refs: Vec<_> = entries.iter().collect();
+        let grouped = group_inventory(&refs);
+        assert_eq!(grouped[0]["location"], "Freezer");
+        assert_eq!(grouped[0]["is_freezer"], true);
+        assert_eq!(
+            grouped[0]["sub_locations"][0]["items"][0]["expires"],
+            "2027-01-01"
+        );
+        let pantry = &grouped[1];
+        assert_eq!(pantry["location"], "Pantry");
+        assert_eq!(pantry["sub_locations"][0]["sub_location"], "");
+        let names: Vec<&str> = pantry["sub_locations"][0]["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| i["food"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["beans", "rice"]);
+        assert_eq!(pantry["sub_locations"][1]["sub_location"], "Produce");
+    }
+
     fn shopping_entries() -> Vec<crate::client::types::ShoppingListEntry> {
         let entry = |id: i32, food_id: i32, food: &str, checked: bool, list_recipe: Option<i32>| {
             json!({
@@ -6435,7 +6946,7 @@ mod annotation_tests {
     #[test]
     fn every_tool_declares_annotations() {
         let tools = TandoorMcpServer::tool_router().list_all();
-        assert_eq!(tools.len(), 55, "unexpected tool count");
+        assert_eq!(tools.len(), 56, "unexpected tool count");
 
         for tool in &tools {
             let name = tool.name.as_ref();

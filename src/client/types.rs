@@ -686,3 +686,54 @@ impl StepIngredient {
         self.food.as_ref().map(|f| f.name.as_str()).unwrap_or("")
     }
 }
+
+/// A place food is stored (Pantry, Fridge, Freezer, ...), owned by a household.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct InventoryLocation {
+    pub id: i32,
+    pub name: String,
+    pub is_freezer: bool,
+    pub household: Option<NamedRef>,
+}
+
+/// One item on the Pantry page: a food in a location, with amount and optional expiry.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct InventoryEntry {
+    pub id: i32,
+    pub inventory_location: Option<InventoryLocation>,
+    pub sub_location: Option<String>,
+    pub food: Option<NamedRef>,
+    pub unit: Option<NamedRef>,
+    #[serde(deserialize_with = "deserialize_decimal")]
+    pub amount: f64,
+    /// YYYY-MM-DD, or None when the entry doesn't expire
+    pub expires: Option<String>,
+    pub note: Option<String>,
+}
+
+impl InventoryEntry {
+    pub fn food_id(&self) -> Option<i32> {
+        self.food.as_ref().map(|f| f.id)
+    }
+
+    pub fn location_name(&self) -> &str {
+        self.inventory_location
+            .as_ref()
+            .map(|l| l.name.as_str())
+            .unwrap_or("")
+    }
+}
+
+/// Tandoor decimals arrive as numbers or, depending on settings, as strings ("1.00").
+fn deserialize_decimal<'de, D>(deserializer: D) -> Result<f64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(match serde_json::Value::deserialize(deserializer)? {
+        serde_json::Value::Number(n) => n.as_f64().unwrap_or(0.0),
+        serde_json::Value::String(s) => s.trim().parse().unwrap_or(0.0),
+        _ => 0.0,
+    })
+}
