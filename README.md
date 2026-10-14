@@ -55,6 +55,18 @@ docker run -d \
   ghcr.io/ryanmac8/tandoor-mcp:latest
 ```
 
+## Home Assistant App
+
+This repo is also a Home Assistant app repository, so Supervisor can install and update the server for you (amd64 and aarch64, e.g. a Raspberry Pi):
+
+1. In Home Assistant go to **Settings → Apps → App Store**, open the **⋮** menu → **Repositories**, and add `https://github.com/PaxonF/tandoor-mcp`.
+2. Refresh, open **Tandoor MCP Server**, and click **Install**.
+3. On the **Configuration** tab set `tandoor_url` and `tandoor_auth_token` (or `tandoor_username` / `tandoor_password`), then **Start**.
+
+The MCP endpoint is `http://<home-assistant-host>:3001/mcp`. The app is defined in [`tandoor_mcp/config.yaml`](tandoor_mcp/config.yaml) and pulls the pre-built `ghcr.io/paxonf/tandoor-mcp-ha` image, so nothing is compiled on the device. Settings from the Configuration tab (`/data/options.json`) take precedence over environment variables.
+
+**Releasing an update:** bump `version` in `tandoor_mcp/config.yaml`, merge to `main`, then push a matching tag (`git tag v0.2.0 && git push origin v0.2.0`). The publish workflow builds the image tag Supervisor pulls, and Home Assistant offers the update.
+
 ## Adding to Claude as a Custom Connector
 
 1. In Claude settings, go to **Integrations → Custom connectors → Add custom connector**
@@ -339,7 +351,7 @@ GitHub Actions runs on every push and pull request:
 | `security`        | `cargo audit` for known vulnerabilities                              |
 | `docker-build`    | builds the Docker image (no push) to verify the `Dockerfile`        |
 
-The `publish` workflow builds a multi-platform image (`linux/amd64`, `linux/arm64`) and pushes it to `ghcr.io/ryanmac8/tandoor-mcp` on push to `main` or a version tag.
+The `publish` workflow builds multi-platform images (`linux/amd64`, `linux/arm64`) on push to `main` or a version tag and pushes two variants to GHCR: `ghcr.io/<owner>/tandoor-mcp` (non-root) and `ghcr.io/<owner>/tandoor-mcp-ha` (the Home Assistant app image, Dockerfile target `ha`, which runs as root so it can read Supervisor's `/data/options.json`).
 
 ## Upstream Patches
 

@@ -1,0 +1,5 @@
+# Lets Home Assistant add this repo as an app repository
+# (Settings → Apps → App Store → ⋮ → Repositories).
+name: Paxon's Home Assistant Apps
+url: https://github.com/PaxonF/tandoor-mcp
+maintainer: Paxon Fischer

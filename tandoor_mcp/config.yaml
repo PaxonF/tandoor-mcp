@@ -1,0 +1,27 @@
+# Home Assistant app definition. Supervisor pulls `image:version`, so `version`
+# must match a published tag: bump it here and push a matching `v<version>` git tag.
+name: Tandoor MCP Server
+description: Model Context Protocol (MCP) server for Tandoor Recipes
+version: "0.1.0"
+slug: tandoor_mcp
+url: https://github.com/PaxonF/tandoor-mcp
+image: ghcr.io/paxonf/tandoor-mcp-ha
+arch:
+  - aarch64
+  - amd64
+startup: services
+boot: auto
+ports:
+  3001/tcp: 3001
+ports_description:
+  3001/tcp: MCP Streamable HTTP endpoint (/mcp)
+options:
+  tandoor_url: http://homeassistant.local:8080
+  tandoor_auth_token: ""
+  log_level: info
+schema:
+  tandoor_url: url
+  tandoor_auth_token: password?
+  tandoor_username: str?
+  tandoor_password: password?
+  log_level: list(trace|debug|info|warn|error)?
