@@ -408,10 +408,19 @@ pub struct MealPlan {
 pub struct MealType {
     pub id: i32,
     pub name: String,
+    #[serde(default)]
     pub order: i32,
-    pub color: String,
+    /// Hex color; null when none was picked in Tandoor
+    pub color: Option<String>,
+    /// Default time of day (HH:MM:SS), if set
+    #[serde(default)]
+    pub time: Option<String>,
+    /// Not returned by current Tandoor versions
+    #[serde(default)]
     pub default: bool,
+    #[serde(default)]
     pub created_by: serde_json::Value,
+    #[serde(default)]
     pub icon: Option<String>,
 }
 

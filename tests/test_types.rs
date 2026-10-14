@@ -4,7 +4,7 @@
 //! correctly handle the API response shapes we've observed in the wild, including
 //! the `created_by` field that ships as a full user object rather than an integer.
 
-use mcp_tandoor::client::{PaginatedResponse, Recipe};
+use mcp_tandoor::client::{MealType, PaginatedResponse, Recipe};
 
 // ── Recipe deserialization ────────────────────────────────────────────────────
 
@@ -152,4 +152,27 @@ fn tandoor_client_set_token_marks_authenticated() {
     client.set_token("tda_test_token".to_string());
     assert!(client.is_authenticated());
     assert_eq!(client.get_token(), Some("tda_test_token"));
+}
+
+// ── MealType deserialization ──────────────────────────────────────────────────
+
+#[test]
+fn meal_type_current_tandoor_shape() {
+    // Current Tandoor omits `default` and may return a null `color`
+    let json = r##"{
+        "count": 2,
+        "next": null,
+        "previous": null,
+        "results": [
+            {"id": 1, "name": "Breakfast", "order": 0, "time": "08:00:00", "color": "#ffc107", "created_by": 1},
+            {"id": 2, "name": "Dinner", "order": 2, "time": null, "color": null, "created_by": 1}
+        ]
+    }"##;
+
+    let page: PaginatedResponse<MealType> =
+        serde_json::from_str(json).expect("should deserialize current meal-type response");
+    assert_eq!(page.results.len(), 2);
+    assert_eq!(page.results[0].time.as_deref(), Some("08:00:00"));
+    assert_eq!(page.results[1].color, None);
+    assert!(!page.results[1].default);
 }

@@ -3135,7 +3135,8 @@ impl TandoorMcpServer {
                             "name": meal_type.name,
                             "order": meal_type.order,
                             "icon": meal_type.icon,
-                            "color": meal_type.color
+                            "color": meal_type.color,
+                            "time": meal_type.time
                         })
                     })
                     .collect();
