@@ -8,11 +8,12 @@ on:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}
 
 jobs:
   # Each platform builds on its own native runner (arm64 under QEMU took ~27 min)
   # and is pushed by digest; the merge job combines them into one multi-arch tag.
+  # Two images come out of the same build: the default non-root image and the
+  # Home Assistant app image (`-ha`, Dockerfile target `ha`, runs as root).
   build:
     strategy:
       fail-fast: true
@@ -29,9 +30,12 @@ jobs:
 
     steps:
       - name: Prepare
-        run: echo "PLATFORM_PAIR=${PLATFORM//\//-}" >> "$GITHUB_ENV"
+        run: |
+          echo "PLATFORM_PAIR=${PLATFORM//\//-}" >> "$GITHUB_ENV"
+          echo "IMAGE=${REGISTRY}/${REPO,,}" >> "$GITHUB_ENV"
         env:
           PLATFORM: ${{ matrix.platform }}
+          REPO: ${{ github.repository }}
 
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -50,7 +54,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          images: ${{ env.IMAGE }}
 
       - name: Build and push by digest
         id: build
@@ -58,39 +62,76 @@ jobs:
         with:
           context: .
           file: ./Dockerfile
+          target: runtime
           platforms: ${{ matrix.platform }}
           labels: ${{ steps.meta.outputs.labels }}
-          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
           cache-from: type=gha,scope=${{ env.PLATFORM_PAIR }}
           cache-to: type=gha,mode=max,scope=${{ env.PLATFORM_PAIR }}
 
-      - name: Export digest
-        run: |
-          mkdir -p "${{ runner.temp }}/digests"
-          digest="${{ steps.build.outputs.digest }}"
-          touch "${{ runner.temp }}/digests/${digest#sha256:}"
+      # Reuses the builder layers from the step above; only the final stage differs
+      - name: Build and push Home Assistant image by digest
+        id: build-ha
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          target: ha
+          platforms: ${{ matrix.platform }}
+          labels: ${{ steps.meta.outputs.labels }}
+          outputs: type=image,name=${{ env.IMAGE }}-ha,push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=${{ env.PLATFORM_PAIR }}
 
-      - name: Upload digest
+      - name: Export digests
+        run: |
+          mkdir -p "${{ runner.temp }}/digests/default" "${{ runner.temp }}/digests/ha"
+          digest="${{ steps.build.outputs.digest }}"
+          touch "${{ runner.temp }}/digests/default/${digest#sha256:}"
+          digest="${{ steps.build-ha.outputs.digest }}"
+          touch "${{ runner.temp }}/digests/ha/${digest#sha256:}"
+
+      - name: Upload default digest
         uses: actions/upload-artifact@v4
         with:
-          name: digests-${{ env.PLATFORM_PAIR }}
-          path: ${{ runner.temp }}/digests/*
+          name: digests-default-${{ env.PLATFORM_PAIR }}
+          path: ${{ runner.temp }}/digests/default/*
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Upload Home Assistant digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-ha-${{ env.PLATFORM_PAIR }}
+          path: ${{ runner.temp }}/digests/ha/*
           if-no-files-found: error
           retention-days: 1
 
   merge:
     runs-on: ubuntu-latest
     needs: build
+    strategy:
+      matrix:
+        include:
+          - variant: default
+            suffix: ""
+          - variant: ha
+            suffix: "-ha"
     permissions:
       contents: read
       packages: write
 
     steps:
+      - name: Prepare
+        run: echo "IMAGE=${REGISTRY}/${REPO,,}${SUFFIX}" >> "$GITHUB_ENV"
+        env:
+          REPO: ${{ github.repository }}
+          SUFFIX: ${{ matrix.suffix }}
+
       - name: Download digests
         uses: actions/download-artifact@v4
         with:
           path: ${{ runner.temp }}/digests
-          pattern: digests-*
+          pattern: digests-${{ matrix.variant }}-*
           merge-multiple: true
 
       - name: Set up Docker Buildx
@@ -107,7 +148,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          images: ${{ env.IMAGE }}
           tags: |
             type=ref,event=branch
             type=ref,event=pr
@@ -122,8 +163,8 @@ jobs:
         run: |
           args=()
           while read -r tag; do args+=(-t "$tag"); done < <(jq -r '.tags[]' <<< "$DOCKER_METADATA_OUTPUT_JSON")
-          for digest in *; do args+=("${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@sha256:${digest}"); done
+          for digest in *; do args+=("${{ env.IMAGE }}@sha256:${digest}"); done
           docker buildx imagetools create "${args[@]}"
 
       - name: Inspect image
-        run: docker buildx imagetools inspect ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}
+        run: docker buildx imagetools inspect ${{ env.IMAGE }}:${{ steps.meta.outputs.version }}
