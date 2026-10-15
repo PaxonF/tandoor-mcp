@@ -54,6 +54,7 @@ async fn test_meal_plan_lifecycle() {
             to_date: date("2031-01-16"),
             meal_type,
             note: None,
+            addshopping: false,
         })
         .await
         .expect("create meal plan");
@@ -110,6 +111,7 @@ async fn test_meal_plan_validation_error_includes_tandoor_details() {
             to_date: date("2031-02-01"),
             meal_type,
             note: None,
+            addshopping: false,
         })
         .await
         .expect("create meal plan");
@@ -130,4 +132,136 @@ async fn test_meal_plan_validation_error_includes_tandoor_details() {
         .delete_meal_plan(created.id)
         .await
         .expect("delete meal plan");
+}
+
+#[tokio::test]
+#[serial]
+async fn test_meal_plan_shopping_list_link() {
+    use mcp_tandoor::client::types::{
+        CreateFoodRequest, CreateRecipeRequest, CreateStepIngredientRequest, CreateStepRequest,
+        CreateUnitRequest,
+    };
+
+    common::init_test_logging();
+    DockerEnvironment::ensure_running().expect("Docker environment not running");
+    let env = TestEnvironment::new()
+        .await
+        .expect("Failed to create test environment");
+
+    let meal_type = ensure_meal_type(&env).await;
+    let recipe = env
+        .client
+        .create_recipe(CreateRecipeRequest {
+            name: format!("MCP shopping link {}", chrono::Utc::now().timestamp()),
+            description: None,
+            servings: Some(2),
+            working_time: 0,
+            waiting_time: 0,
+            keywords: vec![],
+            steps: vec![CreateStepRequest {
+                name: None,
+                instruction: "Cook".to_string(),
+                ingredients: vec![CreateStepIngredientRequest {
+                    food: Some(CreateFoodRequest {
+                        name: "mcp test rice".to_string(),
+                    }),
+                    unit: Some(CreateUnitRequest {
+                        name: "g".to_string(),
+                    }),
+                    amount: "100".to_string(),
+                    note: None,
+                    order: 0,
+                    is_header: false,
+                    no_amount: false,
+                }],
+                time: None,
+                order: 0,
+            }],
+        })
+        .await
+        .expect("create recipe");
+
+    let plan_request = |addshopping| CreateMealPlanRequest {
+        recipe: Some(recipe.id),
+        title: None,
+        servings: 4.0,
+        from_date: date("2031-03-01"),
+        to_date: date("2031-03-01"),
+        meal_type,
+        note: None,
+        addshopping,
+    };
+
+    // addshopping puts the plan on the shopping list, linked to it
+    let auto = env
+        .client
+        .create_meal_plan(plan_request(true))
+        .await
+        .expect("create meal plan with addshopping");
+    assert!(
+        auto.shopping,
+        "plan created with addshopping is on the list"
+    );
+
+    // A plan created without it can be added afterwards, linked the same way
+    let manual = env
+        .client
+        .create_meal_plan(plan_request(false))
+        .await
+        .expect("create meal plan without addshopping");
+    assert!(!manual.shopping);
+    env.client
+        .add_meal_plan_to_shopping(recipe.id, manual.id, manual.servings)
+        .await
+        .expect("add meal plan to shopping");
+    assert!(
+        env.client
+            .get_meal_plan(manual.id)
+            .await
+            .expect("get meal plan")
+            .shopping
+    );
+
+    // Updating without servings must not hit Tandoor's 500 for linked plans, which is
+    // why update_meal_plan always sends them
+    env.client
+        .update_meal_plan(
+            auto.id,
+            serde_json::json!({"note": "moved", "servings": auto.servings}),
+        )
+        .await
+        .expect("update linked meal plan");
+
+    let linked = |groups: &[serde_json::Value], plan: i32| {
+        groups
+            .iter()
+            .filter(|g| g["mealplan"].as_i64() == Some(plan as i64))
+            .count()
+    };
+    let groups = env
+        .client
+        .api_list_all("shopping-list-recipe")
+        .await
+        .expect("list shopping list recipes");
+    assert_eq!(linked(&groups, auto.id), 1);
+    assert_eq!(linked(&groups, manual.id), 1);
+
+    // Deleting a plan removes its shopping list entries
+    for plan in [auto.id, manual.id] {
+        env.client
+            .delete_meal_plan(plan)
+            .await
+            .expect("delete meal plan");
+    }
+    let groups = env
+        .client
+        .api_list_all("shopping-list-recipe")
+        .await
+        .expect("list shopping list recipes");
+    assert_eq!(linked(&groups, auto.id) + linked(&groups, manual.id), 0);
+
+    env.client
+        .delete_recipe(recipe.id)
+        .await
+        .expect("delete recipe");
 }

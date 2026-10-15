@@ -218,13 +218,14 @@ fn create_meal_plan_request_omits_unset_fields() {
         to_date: chrono::NaiveDate::from_ymd_opt(2026, 10, 19).unwrap(),
         meal_type: 1,
         note: None,
+        addshopping: true,
     };
     let body = serde_json::to_value(&request).unwrap();
     assert_eq!(
         body,
         serde_json::json!({
             "recipe": 31, "servings": 6.0, "from_date": "2026-10-19",
-            "to_date": "2026-10-19", "meal_type": 1
+            "to_date": "2026-10-19", "meal_type": 1, "addshopping": true
         })
     );
 }
