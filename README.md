@@ -238,7 +238,7 @@ Items are referred to by food name (e.g. `"lemons"`, plurals match) or entry ID;
 
 **Recipes on the list**
 - `add_recipe_to_shopping_list` — Add a recipe's ingredients, scaled to `servings` and linked to the recipe, skipping foods on hand
-- `add_meal_plan_to_shopping_list` — Add ingredients for meal plans in a date range, skipping foods on hand
+- `add_meal_plan_to_shopping_list` — Backfill: add meal plans in a date range that aren't on the list yet (e.g. made in the Tandoor app). Safe to repeat
 - `get_shopping_list_recipes` — Recipes/meal plans on the list with servings and their items
 - `update_shopping_list_recipe` — Change a recipe's servings; its items are rescaled
 - `remove_recipe_from_shopping_list` — Remove a recipe and the items it added (manually added items stay)
@@ -264,9 +264,9 @@ Items are referred to by food name (e.g. `"lemons"`, plurals match) or entry ID;
 ### Meal Planning
 
 - `get_meal_plans` — Get meal plans for a date range
-- `create_meal_plan` — Create a meal plan for a recipe or free-text title; optional `end_date` for multi-day plans
-- `update_meal_plan` — Update fields on an existing meal plan (recipe, title, servings, date, end_date, meal_type, note) without deleting and recreating it
-- `delete_meal_plan` — Delete a meal plan
+- `create_meal_plan` — Create a meal plan for a recipe or free-text title; optional `end_date` for multi-day plans. A recipe's ingredients go on the shopping list automatically, linked to the plan and skipping foods on hand (`add_to_shopping_list: false` to opt out)
+- `update_meal_plan` — Update fields on an existing meal plan (recipe, title, servings, date, end_date, meal_type, note) without deleting and recreating it. Its shopping list entries follow servings and recipe changes
+- `delete_meal_plan` — Delete a meal plan and its shopping list entries
 - `get_meal_types` — Get available meal types
 - `create_meal_type` — Create a meal type (e.g. Breakfast, Dinner) with an optional default time and color; a new Tandoor has none
 

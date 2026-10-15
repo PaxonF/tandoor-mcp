@@ -514,6 +514,31 @@ impl TandoorClient {
         Ok(())
     }
 
+    /// Add a meal plan's recipe to the shopping list the way Tandoor does when the
+    /// plan is created with `addshopping`: the entries are linked to the plan.
+    pub async fn add_meal_plan_to_shopping(
+        &self,
+        recipe_id: i32,
+        meal_plan_id: i32,
+        servings: f64,
+    ) -> Result<()> {
+        let auth_header = self.get_auth_header()?;
+        let url = format!("{}/api/recipe/{}/shopping/", self.base_url, recipe_id);
+
+        // Tandoor only resolves `mealplan` to a plan when it is an object
+        let response = self
+            .client
+            .put(&url)
+            .header("Authorization", auth_header)
+            .json(&serde_json::json!({"mealplan": {"id": meal_plan_id}, "servings": servings}))
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to connect to Tandoor API: {e}"))?;
+
+        error_for_status(response, "Failed to add meal plan to shopping list").await?;
+        Ok(())
+    }
+
     pub async fn update_food_availability(&self, food_id: i32, available: bool) -> Result<Food> {
         let auth_header = self.get_auth_header()?;
         let url = format!("{}/api/food/{}/", self.base_url, food_id);
@@ -1075,6 +1100,24 @@ impl TandoorClient {
 
         let meal_plan = response.json().await?;
         Ok(meal_plan)
+    }
+
+    pub async fn get_meal_plan(&self, plan_id: i32) -> Result<MealPlan> {
+        let auth_header = self.get_auth_header()?;
+        let url = format!(
+            "{}/api/meal-plan/{}/?{MEAL_PLAN_ANY_DATE}",
+            self.base_url, plan_id
+        );
+
+        let response = self
+            .client
+            .get(&url)
+            .header("Authorization", auth_header)
+            .send()
+            .await?;
+
+        let response = error_for_status(response, "Failed to get meal plan").await?;
+        Ok(response.json().await?)
     }
 
     pub async fn update_meal_plan(

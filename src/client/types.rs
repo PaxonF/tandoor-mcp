@@ -592,6 +592,8 @@ pub struct CreateMealPlanRequest {
     pub meal_type: i32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    /// Have Tandoor add the recipe's ingredients to the shopping list, linked to this plan
+    pub addshopping: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

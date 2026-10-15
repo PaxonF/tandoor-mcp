@@ -1053,6 +1053,26 @@ async fn sync_category_order(
         .map_err(|e| e.to_string())
 }
 
+/// Replace a meal plan's shopping list entries with those of its current recipe.
+async fn replace_meal_plan_shopping(
+    client: &TandoorClient,
+    plan: &crate::client::types::MealPlan,
+) -> anyhow::Result<()> {
+    for group in client.api_list_all("shopping-list-recipe").await? {
+        if group["mealplan"].as_i64() == Some(plan.id as i64) {
+            client
+                .api_delete("shopping-list-recipe", group["id"].as_i64().unwrap_or(0))
+                .await?;
+        }
+    }
+    if let Some(recipe) = &plan.recipe {
+        client
+            .add_meal_plan_to_shopping(recipe.id, plan.id, plan.servings)
+            .await?;
+    }
+    Ok(())
+}
+
 /// Finds a recipe group on the shopping list by recipe name or group ID. Returns the
 /// raw group and its view.
 async fn find_recipe_group(
@@ -1811,6 +1831,10 @@ pub struct CreateMealPlanParams {
     pub meal_type: i32,
     #[serde(default)]
     pub note: Option<String>,
+    /// Add the recipe's ingredients to the shopping list (default true). Only set
+    /// false when the user says not to shop for this meal.
+    #[serde(default)]
+    pub add_to_shopping_list: Option<bool>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -2086,9 +2110,6 @@ pub fn find_duplicate_food_groups(
 pub struct AddMealPlanToShoppingListParams {
     pub from_date: String,
     pub to_date: String,
-    /// Leave out foods marked on hand in the pantry (default true)
-    #[serde(default)]
-    pub skip_on_hand: Option<bool>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -2711,7 +2732,7 @@ impl TandoorMcpServer {
 
     // Shopping list tools
     #[tool(
-        description = "Add items to the shopping list in plain words, e.g. items: [\"3 lemons\", \"2 lb chicken thighs\", \"milk\", \"1/2 cup parsley\", \"a dozen eggs\"]. Amount and unit are read from the text; foods are matched by name (plurals included) and created if new. If the same food and unit is already on the list it increases that line instead of adding a duplicate (merge_with_existing, default true). For a recipe's ingredients use add_recipe_to_shopping_list.",
+        description = "Add items to the shopping list in plain words, e.g. items: [\"3 lemons\", \"2 lb chicken thighs\", \"milk\", \"1/2 cup parsley\", \"a dozen eggs\"]. Amount and unit are read from the text; foods are matched by name (plurals included) and created if new. If the same food and unit is already on the list it increases that line instead of adding a duplicate (merge_with_existing, default true). For a recipe's ingredients use add_recipe_to_shopping_list. Never use this for a meal plan's ingredients: create_meal_plan already adds them.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -3303,7 +3324,7 @@ impl TandoorMcpServer {
     }
 
     #[tool(
-        description = "Create a meal plan entry for a recipe (or a free-text title) on a date. Get meal_type IDs from get_meal_types",
+        description = "Create a meal plan entry for a recipe (or a free-text title) on a date. Get meal_type IDs from get_meal_types. For a recipe, this ALSO adds its ingredients to the shopping list (scaled to servings, skipping pantry items), linked to the plan so update_meal_plan rescales them and delete_meal_plan removes them. Do NOT add the recipe's ingredients yourself with add_to_shopping_list or add_recipe_to_shopping_list — that would put them on the list twice.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -3371,6 +3392,7 @@ impl TandoorMcpServer {
             to_date,
             meal_type: params.meal_type,
             note: params.note,
+            addshopping: params.add_to_shopping_list.unwrap_or(true),
         };
 
         match client.create_meal_plan(request).await {
@@ -3385,8 +3407,13 @@ impl TandoorMcpServer {
                     "title": meal_plan.title,
                     "servings": meal_plan.servings,
                     "note": meal_plan.note,
+                    "on_shopping_list": meal_plan.shopping,
                     "success": true,
-                    "message": "Meal plan created successfully"
+                    "message": if meal_plan.shopping {
+                        "Meal plan created and its ingredients added to the shopping list. Nothing else to add."
+                    } else {
+                        "Meal plan created (not added to the shopping list)"
+                    }
                 });
 
                 Ok(CallToolResult::success(vec![Content::text(
@@ -3407,7 +3434,7 @@ impl TandoorMcpServer {
     }
 
     #[tool(
-        description = "Update fields on an existing meal plan (recipe, title, servings, date, end_date, meal_type, note) without deleting and recreating it",
+        description = "Update fields on an existing meal plan (recipe, title, servings, date, end_date, meal_type, note) without deleting and recreating it. If the plan is on the shopping list, its entries follow automatically (rescaled for new servings, replaced for a new recipe); don't edit them yourself.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -3428,6 +3455,18 @@ impl TandoorMcpServer {
             }
         };
 
+        let current = match client.get_meal_plan(params.id).await {
+            Ok(plan) => plan,
+            Err(e) => {
+                return Ok(CallToolResult::error(vec![Content::text(
+                    json!({"error": "Failed to get meal plan", "details": e.to_string()})
+                        .to_string(),
+                )]));
+            }
+        };
+        let old_recipe = current.recipe.as_ref().map(|r| r.id);
+        let recipe_changed = params.recipe_id.is_some() && params.recipe_id != old_recipe;
+
         let mut body = serde_json::Map::new();
         if let Some(v) = params.recipe_id {
             body.insert("recipe".to_string(), json!(v));
@@ -3435,9 +3474,10 @@ impl TandoorMcpServer {
         if let Some(v) = params.title {
             body.insert("title".to_string(), json!(v));
         }
-        if let Some(v) = params.servings {
-            body.insert("servings".to_string(), json!(v));
-        }
+        // Tandoor errors (500) on an update without servings once the plan is on the
+        // shopping list, so always send them
+        let servings = params.servings.unwrap_or(current.servings);
+        body.insert("servings".to_string(), json!(servings));
         // Tandoor silently ignores a `date` key, so set from_date/to_date. Moving the
         // start without an explicit end keeps the plan single-day on the new date.
         let from_date = params
@@ -3467,33 +3507,53 @@ impl TandoorMcpServer {
             body.insert("note".to_string(), json!(v));
         }
 
-        match client
+        let mut meal_plan = match client
             .update_meal_plan(params.id, serde_json::Value::Object(body))
             .await
         {
-            Ok(meal_plan) => Ok(CallToolResult::success(vec![Content::text(
-                serde_json::to_string_pretty(&json!({
-                    "id": meal_plan.id,
-                    "date": meal_plan.date(),
-                    "end_date": meal_plan.end_date(),
-                    "meal_type": meal_plan.meal_type.name,
-                    "recipe_id": meal_plan.recipe.as_ref().map(|r| r.id),
-                    "recipe_name": meal_plan.recipe.as_ref().map(|r| &r.name),
-                    "title": meal_plan.title,
-                    "servings": meal_plan.servings,
-                    "note": meal_plan.note
-                }))
-                .unwrap(),
-            )])),
-            Err(e) => Ok(CallToolResult::error(vec![Content::text(
-                json!({"error": "Failed to update meal plan", "details": e.to_string()})
+            Ok(plan) => plan,
+            Err(e) => {
+                return Ok(CallToolResult::error(vec![Content::text(
+                    json!({"error": "Failed to update meal plan", "details": e.to_string()})
+                        .to_string(),
+                )]));
+            }
+        };
+
+        // Tandoor keeps the old recipe's shopping entries when the recipe changes,
+        // so swap them for the new recipe's
+        if recipe_changed && current.shopping {
+            if let Err(e) = replace_meal_plan_shopping(&client, &meal_plan).await {
+                return Ok(CallToolResult::error(vec![Content::text(
+                    json!({
+                        "error": "Meal plan updated, but its shopping list entries still belong to the old recipe",
+                        "details": e.to_string()
+                    })
                     .to_string(),
-            )])),
+                )]));
+            }
+            meal_plan.shopping = true;
         }
+
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&json!({
+                "id": meal_plan.id,
+                "date": meal_plan.date(),
+                "end_date": meal_plan.end_date(),
+                "meal_type": meal_plan.meal_type.name,
+                "recipe_id": meal_plan.recipe.as_ref().map(|r| r.id),
+                "recipe_name": meal_plan.recipe.as_ref().map(|r| &r.name),
+                "title": meal_plan.title,
+                "servings": meal_plan.servings,
+                "note": meal_plan.note,
+                "on_shopping_list": meal_plan.shopping
+            }))
+            .unwrap(),
+        )]))
     }
 
     #[tool(
-        description = "Delete a meal plan",
+        description = "Delete a meal plan. Its shopping list entries are removed with it.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -5150,7 +5210,7 @@ impl TandoorMcpServer {
     }
 
     #[tool(
-        description = "Add a recipe's ingredients to the shopping list, scaled to `servings`, skipping foods already on hand in the pantry (listed in skipped_on_hand) unless include_on_hand is true. Entries are linked to the recipe in Tandoor.",
+        description = "Add a recipe's ingredients to the shopping list, scaled to `servings`, skipping foods already on hand in the pantry (listed in skipped_on_hand) unless include_on_hand is true. Entries are linked to the recipe in Tandoor. For a recipe on the meal plan, do not use this: create_meal_plan already adds it (use add_meal_plan_to_shopping_list for older plans).",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -5356,7 +5416,7 @@ impl TandoorMcpServer {
     }
 
     #[tool(
-        description = "Add all recipe ingredients from meal plans in a date range to the shopping list. Foods already on hand are skipped (listed in skipped_on_hand) unless skip_on_hand is false.",
+        description = "Backfill: put meal plans in a date range on the shopping list if they are not on it yet (e.g. plans made in the Tandoor app, or with add_to_shopping_list false). Plans already on the list are left alone, so it is safe to call again. Not needed after create_meal_plan, which adds its plan itself.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -5389,85 +5449,52 @@ impl TandoorMcpServer {
             }
         };
 
-        let mut added = 0usize;
-        let mut skipped = 0usize;
-        let mut added_items: Vec<serde_json::Value> = Vec::new();
-        let skip_on_hand = params.skip_on_hand.unwrap_or(true);
-        let mut skipped_on_hand: Vec<String> = Vec::new();
+        let mut added: Vec<serde_json::Value> = Vec::new();
+        let mut already_on_list: Vec<serde_json::Value> = Vec::new();
+        let mut failed: Vec<serde_json::Value> = Vec::new();
+        let mut no_recipe = 0usize;
 
         for plan in &meal_plans {
-            let recipe = match &plan.recipe {
-                Some(r) => r,
-                None => {
-                    skipped += 1;
-                    continue;
-                }
+            let Some(recipe) = &plan.recipe else {
+                no_recipe += 1;
+                continue;
             };
-
-            let detailed = match client.get_recipe(recipe.id).await {
-                Ok(r) => r,
-                Err(_) => {
-                    skipped += 1;
-                    continue;
-                }
-            };
-
-            let scale = plan.servings / detailed.servings.unwrap_or(1) as f64;
-
-            for step in &detailed.steps {
-                for ingredient in &step.ingredients {
-                    let Some(food) = ingredient.food.as_ref() else {
-                        continue;
-                    };
-                    if ingredient.is_header || ingredient.no_amount {
-                        continue;
-                    }
-                    if skip_on_hand && food.food_onhand {
-                        if !skipped_on_hand.contains(&food.name) {
-                            skipped_on_hand.push(food.name.clone());
-                        }
-                        continue;
-                    }
-                    let request = crate::client::types::CreateShoppingListEntryRequest {
-                        food: food.id,
-                        unit: ingredient.unit.as_ref().map(|u| u.id),
-                        amount: (ingredient.amount * scale * 10.0).round() / 10.0,
-                    };
-                    match client.add_to_shopping_list(request).await {
-                        Ok(_) => {
-                            added += 1;
-                            added_items.push(json!({
-                                "food": food.name,
-                                "amount": (ingredient.amount * scale * 10.0).round() / 10.0,
-                                "unit": ingredient.unit.as_ref().map(|u| &u.name),
-                                "from_recipe": recipe.name
-                            }));
-                        }
-                        Err(_) => {
-                            skipped += 1;
-                        }
-                    }
-                }
+            let summary =
+                json!({"meal_plan_id": plan.id, "date": plan.date(), "recipe": recipe.name});
+            if plan.shopping {
+                already_on_list.push(summary);
+                continue;
+            }
+            match client
+                .add_meal_plan_to_shopping(recipe.id, plan.id, plan.servings)
+                .await
+            {
+                Ok(()) => added.push(summary),
+                Err(e) => failed.push(json!({"meal_plan_id": plan.id, "error": e.to_string()})),
             }
         }
 
-        Ok(CallToolResult::success(vec![Content::text(
-            serde_json::to_string_pretty(&json!({
-                "added": added,
-                "skipped": skipped,
-                "meal_plans_processed": meal_plans.len(),
-                "skipped_on_hand": skipped_on_hand,
-                "items": added_items,
-                "message": format!(
-                    "Added {} ingredients to shopping list from {} meal plans ({} to {})",
-                    added,
-                    meal_plans.len(),
-                    params.from_date,
-                    params.to_date
-                )
-            }))
-            .unwrap(),
-        )]))
+        let result = json!({
+            "added": added,
+            "already_on_list": already_on_list,
+            "failed": failed,
+            "skipped_without_recipe": no_recipe,
+            "message": format!(
+                "{} to {}: added {} meal plans to the shopping list, {} already on it",
+                params.from_date,
+                params.to_date,
+                added.len(),
+                already_on_list.len()
+            )
+        });
+        let content = vec![Content::text(
+            serde_json::to_string_pretty(&result).unwrap(),
+        )];
+        if failed.is_empty() {
+            Ok(CallToolResult::success(content))
+        } else {
+            Ok(CallToolResult::error(content))
+        }
     }
 
     #[tool(
