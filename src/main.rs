@@ -163,7 +163,13 @@ async fn main() -> anyhow::Result<()> {
     let service = StreamableHttpService::new(
         move || Ok(TandoorMcpServer::new(base_url_clone.clone())),
         LocalSessionManager::default().into(),
-        StreamableHttpServerConfig::default(),
+        // Stateless: each POST is served on its own, so clients that don't
+        // carry Mcp-Session-Id between requests (e.g. Gemini) still work.
+        // Nothing here is per-session; auth lives in process-wide globals.
+        StreamableHttpServerConfig {
+            stateful_mode: false,
+            ..Default::default()
+        },
     );
 
     let router = axum::Router::new().nest_service("/mcp", service);
